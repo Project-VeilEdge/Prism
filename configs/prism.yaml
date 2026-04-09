@@ -1,0 +1,85 @@
+mode: standalone
+
+ech:
+  public_name: "prism.example.com"
+  key_path: "/etc/prism/ech-key.pem"
+
+whitelist_path: "/etc/prism/whitelist.yaml"
+users_path: "/etc/prism/users.yaml"
+routing_path: "/etc/prism/routing.yaml"
+geoip_db_path: "/etc/prism/GeoLite2-Country.mmdb"
+
+camouflage:
+  theme: "minimal"
+  site_name: ""
+  seed: 0
+
+certs:
+  mode: "manual"
+  manual:
+    doh_cert: "/etc/prism/certs/doh.pem"
+    doh_key: "/etc/prism/certs/doh-key.pem"
+    gateway_cert: "/etc/prism/certs/gateway.pem"
+    gateway_key: "/etc/prism/certs/gateway-key.pem"
+  acme:
+    email: "ops@example.com"
+    domains:
+      - "prism.example.com"
+      - "gateway.prism.example.com"
+    provider: "cloudflare"
+    cert_dir: "/var/lib/prism/acme"
+    renew_before: "720h"
+
+controller:
+  listen: ":9090"
+  store:
+    dsn: "/var/lib/prism/prism.db"
+  mtls:
+    ca_cert: "/etc/prism/mtls/ca.pem"
+    server_cert: "/etc/prism/mtls/server.pem"
+    server_key: "/etc/prism/mtls/server-key.pem"
+
+node:
+  id: "gw-1"
+  controller: "controller.internal:9090"
+  cache_path: "/var/lib/prism/node-config-cache.json"
+  mtls:
+    ca_cert: "/etc/prism/mtls/ca.pem"
+    client_cert: "/etc/prism/mtls/node.pem"
+    client_key: "/etc/prism/mtls/node-key.pem"
+
+dns:
+  listen_doh: ":443"
+  upstream_doh: "https://1.1.1.1/dns-query"
+  upstream_doh_fallback: "https://8.8.8.8/dns-query"
+  auth:
+    enable_bearer_tokens: true
+  rate_limit:
+    enabled: true
+    max_requests: 5
+    window: "1s"
+    cleanup_ttl: "60s"
+    cleanup_frequency: "30s"
+
+gateway:
+  listen_tcp: ":443"
+
+egress:
+  listen: ":9443"
+  static_allow_ips: ["198.51.100.1"]
+  static_allow_cidrs: ["198.51.100.0/24"]
+  deny_private_targets: true
+
+client:
+  dns_listen: "127.0.0.1:10053"
+  tls_listen: "127.0.0.1:10443"
+  gateway: "prism.example.com:443"
+
+standalone:
+  allow_legacy_hex_users: false
+
+self_ip: "198.51.100.1"
+base_domain: "prism.example.com"
+log_level: "info"
+
+# Health and Prometheus metrics live on the single --metrics-addr listener.

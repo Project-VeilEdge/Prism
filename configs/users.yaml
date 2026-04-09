@@ -1,0 +1,22 @@
+# Example users file for standalone mode.
+# Hashes are computed as SHA256(id + ":prism")[:12] if omitted.
+# Legacy 12-char hex acceptance is disabled by default; use
+# standalone.allow_legacy_hex_users: true only for local compatibility work.
+#
+# Usage: set users_path in prism.yaml to point to this file.
+#   users_path: /etc/prism/users.yaml
+#
+# Create users via CLI:
+#   prism --mode user create --name alice --file /etc/prism/users.yaml
+#
+# Changes are hot-reloaded only in local standalone mode when
+# node.controller is empty. Controller-connected standalone gets user
+# updates from controller sync instead of local file watching.
+
+users:
+  - id: alice
+    token: ""
+    active: true
+  - id: bob
+    token: "replace-with-a-real-token"
+    active: true

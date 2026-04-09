@@ -1,0 +1,17 @@
+egress_nodes:
+  - name: tokyo
+    address: "203.0.113.10:9443"
+  - name: us-west
+    address: "198.51.100.10:9443"
+  - name: direct
+    address: ""
+
+rules:
+  - match: { domain: "*.bilibili.com" }
+    egress: tokyo
+  - match: { cidr: ["142.250.0.0/15"] }
+    egress: us-west
+  - match: { geoip: { country: ["JP", "KR"] } }
+    egress: tokyo
+  - match: { default: true }
+    egress: direct

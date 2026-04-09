@@ -1,0 +1,262 @@
+syntax = "proto3";
+
+package control;
+
+option go_package = "prism/api/proto/control";
+
+// ---------------------------------------------------------------------------
+// ConfigSync — pushes configuration updates to connected Gateway/DNS nodes.
+// ---------------------------------------------------------------------------
+
+service ConfigSync {
+  // WatchConfig opens a server-streaming RPC. The controller pushes
+  // ConfigUpdate messages whenever whitelist, routing rules, users,
+  // ECH keys, or egress IP lists change.
+  rpc WatchConfig(WatchConfigRequest) returns (stream ConfigUpdate);
+}
+
+message WatchConfigRequest {
+  // node_id identifies the calling gateway/dns/egress node.
+  string node_id = 1;
+  // config_version is the last version the node has. The controller sends
+  // all updates newer than this. Use 0 for a full sync.
+  uint64 config_version = 2;
+}
+
+message ConfigUpdate {
+  // Monotonically increasing version number.
+  uint64 version = 1;
+  // Which configuration section changed.
+  ConfigType config_type = 2;
+  // Serialized payload (one of the oneof fields below).
+  oneof payload {
+    WhitelistConfig   whitelist   = 10;
+    RoutingConfig     routing     = 11;
+    UserList          users       = 12;
+    ECHKeyConfig      ech_keys    = 13;
+    EgressIPList      egress_ips  = 14;
+  }
+}
+
+enum ConfigType {
+  CONFIG_TYPE_UNSPECIFIED  = 0;
+  CONFIG_TYPE_WHITELIST    = 1;
+  CONFIG_TYPE_ROUTING      = 2;
+  CONFIG_TYPE_USERS        = 3;
+  CONFIG_TYPE_ECH_KEYS     = 4;
+  CONFIG_TYPE_EGRESS_IPS   = 5;
+}
+
+message WhitelistConfig {
+  // Domains with "." prefix are suffix matches; otherwise exact.
+  repeated string domains = 1;
+}
+
+message RoutingConfig {
+  repeated EgressNodeProto  nodes = 1;
+  repeated RoutingRuleProto rules = 2;
+}
+
+message EgressNodeProto {
+  string name    = 1;
+  string address = 2; // "host:port"; empty = direct
+}
+
+message RoutingRuleProto {
+  oneof match {
+    string       domain    = 1; // "*.example.com" or "example.com"
+    CIDRMatch    cidr      = 2;
+    GeoIPMatch   geoip     = 3;
+    bool         is_default = 4;
+  }
+  string egress_node = 10; // name reference into EgressNodeProto.name
+}
+
+message CIDRMatch {
+  repeated string cidrs = 1; // e.g. "142.250.0.0/15"
+}
+
+message GeoIPMatch {
+  repeated string countries = 1; // ISO 3166-1 alpha-2
+}
+
+message UserList {
+  repeated UserProto users = 1;
+}
+
+message UserProto {
+  string user_id    = 1;
+  string name       = 2;
+  string hash       = 3; // SHA256(user_id+":"+salt)[:12]
+  string token      = 4; // optional bearer token
+  bool   active     = 5;
+  int64  created_at = 6; // unix seconds
+}
+
+message ECHKeyConfig {
+  // PEM-encoded current private key.
+  bytes  current_private_key_pem = 1;
+  uint32 current_config_id      = 2;
+  // PEM-encoded previous private key (may be empty during first deployment).
+  bytes  previous_private_key_pem = 3;
+  uint32 previous_config_id       = 4;
+  // Serialized ECHConfigList for DNS to serve.
+  bytes  ech_config_list = 5;
+}
+
+message EgressIPList {
+  // Gateway IPs that egress nodes should allow.
+  repeated string ips   = 1;
+  repeated string cidrs = 2;
+}
+
+// ---------------------------------------------------------------------------
+// NodeReport — gateways stream traffic metrics to the controller.
+// ---------------------------------------------------------------------------
+
+service NodeReport {
+  // ReportTraffic accepts a client-streaming RPC of traffic metric batches.
+  rpc ReportTraffic(stream TrafficBatch) returns (ReportAck);
+}
+
+message TrafficBatch {
+  string                  node_id = 1;
+  repeated TrafficRecord  records = 2;
+}
+
+message TrafficRecord {
+  string user_id     = 1;
+  string domain      = 2;
+  string client_ip   = 3;
+  string egress      = 4;
+  int64  bytes_up    = 5;
+  int64  bytes_down  = 6;
+  int64  start_time  = 7; // unix seconds
+  int64  end_time    = 8; // unix seconds
+  bool   ech_success = 9;
+  string error_type  = 10;
+}
+
+message ReportAck {
+  int64 received = 1; // total records accepted
+}
+
+// ---------------------------------------------------------------------------
+// UserAudit — user CRUD and query.
+// ---------------------------------------------------------------------------
+
+service UserAudit {
+  rpc CreateUser(CreateUserRequest)   returns (CreateUserResponse);
+  rpc GetUser(GetUserRequest)         returns (UserProto);
+  rpc ListUsers(ListUsersRequest)     returns (ListUsersResponse);
+  rpc UpdateUser(UpdateUserRequest)   returns (UserProto);
+  rpc DeleteUser(DeleteUserRequest)   returns (DeleteUserResponse);
+  rpc AuthUser(AuthUserRequest)       returns (AuthUserResponse);
+}
+
+message CreateUserRequest {
+  string user_id = 1;
+  string name    = 2;
+  string token   = 3; // optional bearer token
+}
+
+message CreateUserResponse {
+  UserProto user = 1;
+}
+
+message GetUserRequest {
+  string user_id = 1;
+}
+
+message ListUsersRequest {
+  bool active_only = 1;
+}
+
+message ListUsersResponse {
+  repeated UserProto users = 1;
+}
+
+message UpdateUserRequest {
+  string user_id = 1;
+  // Fields to update. Only non-empty fields are applied.
+  string name   = 2;
+  string token  = 3;
+  // Optional: only overwrites Active when explicitly set.
+  optional bool active = 4;
+}
+
+message UpdateUserResponse {
+  UserProto user = 1;
+}
+
+message DeleteUserRequest {
+  string user_id = 1;
+}
+
+message DeleteUserResponse {}
+
+message AuthUserRequest {
+  // The hex hash extracted from outer SNI or DoH path.
+  string hash  = 1;
+  // Optional bearer token for double auth.
+  string token = 2;
+}
+
+message AuthUserResponse {
+  bool      valid   = 1;
+  UserProto user    = 2;
+}
+
+// ---------------------------------------------------------------------------
+// DNSAudit — DNS nodes stream audit records to the controller.
+// ---------------------------------------------------------------------------
+
+service DNSAudit {
+  rpc ReportDNS(stream DNSAuditBatch) returns (DNSAuditAck);
+}
+
+message DNSAuditBatch {
+  string                   node_id = 1;
+  repeated DNSAuditRecord  records = 2;
+}
+
+message DNSAuditRecord {
+  string user_id    = 1;
+  string domain     = 2;
+  string query_type = 3; // "A", "AAAA", "HTTPS", etc.
+  string client_ip  = 4;
+  int64  timestamp  = 5; // unix seconds
+}
+
+message DNSAuditAck {
+  int64 received = 1;
+}
+
+// ---------------------------------------------------------------------------
+// TrafficQuery — aggregated traffic queries.
+// ---------------------------------------------------------------------------
+
+service TrafficQuery {
+  rpc QueryTraffic(TrafficQueryRequest) returns (TrafficQueryResponse);
+}
+
+message TrafficQueryRequest {
+  string user_id    = 1; // optional filter
+  string domain     = 2; // optional filter
+  string egress     = 3; // optional filter
+  int64  start_time = 4; // unix seconds
+  int64  end_time   = 5; // unix seconds
+}
+
+message TrafficQueryResponse {
+  repeated TrafficSummary summaries = 1;
+}
+
+message TrafficSummary {
+  string user_id    = 1;
+  string domain     = 2;
+  string egress     = 3;
+  int64  bytes_up   = 4;
+  int64  bytes_down = 5;
+  int64  count      = 6; // number of connections
+}
