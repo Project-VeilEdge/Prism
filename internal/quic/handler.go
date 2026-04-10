@@ -1,6 +1,10 @@
 package quic
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"sync"
@@ -8,6 +12,7 @@ import (
 	"time"
 
 	"prism/internal/ech"
+	"prism/internal/egress"
 )
 
 const (
@@ -26,6 +31,8 @@ const (
 	// Once reached, new sessions are silently dropped to prevent memory exhaustion
 	// from UDP floods with spoofed source addresses.
 	DefaultMaxSessions = 100_000
+
+	sessionSetupTimeout = 5 * time.Second
 )
 
 // FiveTuple uniquely identifies a UDP "session" (since UDP is connectionless).
@@ -48,17 +55,17 @@ func MakeFiveTuple(src, dst *net.UDPAddr) FiveTuple {
 
 // Session tracks a single UDP "connection" between client and upstream.
 type Session struct {
-	mu           sync.Mutex
-	Key          FiveTuple
-	ClientAddr   *net.UDPAddr   // original client address
-	UpstreamConn net.PacketConn // connection to upstream server
-	UpstreamAddr *net.UDPAddr   // upstream target address
-	LastActive   time.Time
-	BytesUp      int64
-	BytesDown    int64
-	InnerSNI     string
-	UserID       string
-	Closed       bool
+	mu          sync.Mutex
+	cleanupOnce sync.Once
+	Key         FiveTuple
+	ClientAddr  *net.UDPAddr // original client address
+	Upstream    DatagramSession
+	LastActive  time.Time
+	BytesUp     int64
+	BytesDown   int64
+	InnerSNI    string
+	UserID      string
+	Closed      bool
 }
 
 // Touch updates the last activity timestamp.
@@ -76,14 +83,19 @@ func (s *Session) Close() {
 		return
 	}
 	s.Closed = true
-	if s.UpstreamConn != nil {
-		s.UpstreamConn.Close()
+	if s.Upstream != nil {
+		_ = s.Upstream.Close()
 	}
 }
 
 // ECHDecryptor abstracts the ECH key set for decryption.
 type ECHDecryptor interface {
-	Decrypt(result *ech.ParseResult) (innerSNI string, innerCHRecord []byte, err error)
+	DecryptWithPublicName(result *ech.ParseResult, publicName string) (innerSNI string, innerCHRecord []byte, err error)
+}
+
+// ECHKeySource provides the current ECH key set.
+type ECHKeySource interface {
+	KeySet() *ech.KeySet
 }
 
 // UserMatcher abstracts user lookup by hash from outer SNI.
@@ -97,6 +109,111 @@ type WhitelistChecker interface {
 	Contains(domain string) bool
 }
 
+// Resolver resolves a domain to IP addresses.
+type Resolver interface {
+	Resolve(ctx context.Context, domain string) ([]net.IP, error)
+}
+
+// RouteSelector selects egress nodes in priority order.
+type RouteSelector interface {
+	RouteAll(domain string, targetIP net.IP) []*egress.EgressNode
+}
+
+// DatagramSession represents a UDP session to an upstream target.
+type DatagramSession = egress.DatagramSession
+
+// DatagramSessionFactory opens outbound UDP sessions.
+type DatagramSessionFactory interface {
+	ListenPacket(ctx context.Context, network, address string) (net.PacketConn, error)
+}
+
+// DatagramEgressClient forwards datagrams through a remote egress node.
+type DatagramEgressClient interface {
+	OpenSession(ctx context.Context, node *egress.EgressNode, targetIP net.IP, targetPort uint16, firstDatagram []byte) (egress.DatagramSession, error)
+}
+
+type netPacketFactory struct{}
+
+func (netPacketFactory) ListenPacket(ctx context.Context, network, address string) (net.PacketConn, error) {
+	var lc net.ListenConfig
+	return lc.ListenPacket(ctx, network, address)
+}
+
+type directDatagramSession struct {
+	conn      net.PacketConn
+	target    net.Addr
+	closeOnce sync.Once
+}
+
+func newDirectDatagramSession(conn net.PacketConn, target net.Addr) DatagramSession {
+	return &directDatagramSession{conn: conn, target: target}
+}
+
+func (s *directDatagramSession) Write(datagram []byte) error {
+	_, err := s.conn.WriteTo(datagram, s.target)
+	return err
+}
+
+func (s *directDatagramSession) Read(ctx context.Context) ([]byte, error) {
+	buf := make([]byte, MaxDatagramSize)
+	for {
+		deadline, hasDeadline := ctx.Deadline()
+		if !hasDeadline {
+			deadline = time.Now().Add(250 * time.Millisecond)
+		}
+		if err := s.conn.SetReadDeadline(deadline); err != nil {
+			return nil, err
+		}
+
+		n, addr, err := s.conn.ReadFrom(buf)
+		if err != nil {
+			if !hasDeadline {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					if ctx.Err() != nil {
+						return nil, ctx.Err()
+					}
+					continue
+				}
+			}
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, err
+		}
+		if !sameDatagramAddr(s.target, addr) {
+			continue
+		}
+
+		payload := make([]byte, n)
+		copy(payload, buf[:n])
+		return payload, nil
+	}
+}
+
+func (s *directDatagramSession) Close() error {
+	var err error
+	s.closeOnce.Do(func() {
+		err = s.conn.Close()
+	})
+	return err
+}
+
+func sameDatagramAddr(expected, actual net.Addr) bool {
+	if expected == nil || actual == nil {
+		return false
+	}
+
+	expectedUDP, expectedOK := expected.(*net.UDPAddr)
+	actualUDP, actualOK := actual.(*net.UDPAddr)
+	if expectedOK && actualOK {
+		return expectedUDP.IP.Equal(actualUDP.IP) &&
+			expectedUDP.Port == actualUDP.Port &&
+			expectedUDP.Zone == actualUDP.Zone
+	}
+
+	return expected.Network() == actual.Network() && expected.String() == actual.String()
+}
+
 // Handler is the UDP Gateway that intercepts QUIC traffic,
 // parses Initial packets for ECH, and forwards datagrams.
 type Handler struct {
@@ -106,10 +223,19 @@ type Handler struct {
 	// ECH decryption.
 	KeySet ECHDecryptor
 
+	// KeySource allows the handler to use the current ECH key set.
+	KeySource ECHKeySource
+
 	// User validation.
 	Users      UserMatcher
 	Whitelist  WhitelistChecker
 	BaseDomain string
+
+	// Target resolution and routing.
+	Resolver       Resolver
+	Router         RouteSelector
+	EgressClient   DatagramEgressClient
+	SessionFactory DatagramSessionFactory
 
 	// MaxSessions is the maximum number of concurrent sessions.
 	// Zero means DefaultMaxSessions.
@@ -147,6 +273,18 @@ func (h *Handler) maxSessions() int64 {
 		return h.MaxSessions
 	}
 	return DefaultMaxSessions
+}
+
+func (h *Handler) currentKeySet() ECHDecryptor {
+	if h == nil {
+		return nil
+	}
+	if h.KeySource != nil {
+		if current := h.KeySource.KeySet(); current != nil {
+			return current
+		}
+	}
+	return h.KeySet
 }
 
 // Serve runs the main read loop. It blocks until Stop is called or a fatal error occurs.
@@ -207,10 +345,7 @@ func (h *Handler) Stop() {
 
 	// Close all active sessions.
 	h.sessions.Range(func(key, val any) bool {
-		sess := val.(*Session)
-		sess.Close()
-		h.sessions.Delete(key)
-		h.sessionCount.Add(-1)
+		h.closeSession(val.(*Session))
 		return true
 	})
 }
@@ -218,6 +353,165 @@ func (h *Handler) Stop() {
 // SessionCount returns the number of active sessions (for metrics/tests).
 func (h *Handler) SessionCount() int {
 	return int(h.sessionCount.Load())
+}
+
+func (h *Handler) closeSession(sess *Session) {
+	if sess == nil {
+		return
+	}
+
+	sess.cleanupOnce.Do(func() {
+		sess.Close()
+		h.sessions.Delete(sess.Key)
+		h.sessionCount.Add(-1)
+		slog.Info("quic/handler: session closed",
+			"domain", sess.InnerSNI, "user", sess.UserID,
+			"bytes_up", sess.BytesUp, "bytes_down", sess.BytesDown)
+	})
+}
+
+func (h *Handler) prepareInitialPacket(innerRecord []byte, originalDatagram []byte) ([]byte, error) {
+	handshake, err := HandshakeMessageFromRecord(innerRecord)
+	if err != nil {
+		return nil, fmt.Errorf("extract inner handshake: %w", err)
+	}
+	rewritten, err := RewriteInitialPacket(originalDatagram, handshake)
+	if err != nil {
+		return nil, fmt.Errorf("rewrite initial packet: %w", err)
+	}
+	return rewritten, nil
+}
+
+func (h *Handler) resolveRoute(ctx context.Context, innerSNI string) ([]*egress.EgressNode, []net.IP, error) {
+	if h.Resolver == nil {
+		return nil, nil, fmt.Errorf("resolver unavailable")
+	}
+
+	ips, err := h.Resolver.Resolve(ctx, innerSNI)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(ips) == 0 {
+		return nil, nil, fmt.Errorf("no target IPs resolved for %q", innerSNI)
+	}
+
+	directNode := &egress.EgressNode{Name: "direct"}
+	if h.Router == nil {
+		return []*egress.EgressNode{directNode}, ips, nil
+	}
+
+	nodes := h.Router.RouteAll(innerSNI, ips[0])
+	if len(nodes) == 0 {
+		return []*egress.EgressNode{directNode}, ips, nil
+	}
+
+	return nodes, ips, nil
+}
+
+func (h *Handler) sessionFactory() DatagramSessionFactory {
+	if h.SessionFactory != nil {
+		return h.SessionFactory
+	}
+	return netPacketFactory{}
+}
+
+func normalizeRouteNode(node *egress.EgressNode) *egress.EgressNode {
+	if node == nil {
+		return nil
+	}
+	if node.IsDirect() && node.Name == "" {
+		return &egress.EgressNode{Name: "direct"}
+	}
+	return node
+}
+
+func (h *Handler) openDirectSession(ctx context.Context, targetIPs []net.IP, targetPort uint16, firstDatagram []byte) (DatagramSession, net.IP, error) {
+	if len(targetIPs) == 0 {
+		return nil, nil, fmt.Errorf("no target IPs available for direct session")
+	}
+
+	var lastErr error
+	for _, targetIP := range targetIPs {
+		if targetIP == nil {
+			lastErr = fmt.Errorf("missing target IP for direct session")
+			continue
+		}
+
+		packetConn, err := h.sessionFactory().ListenPacket(ctx, "udp", ":0")
+		if err != nil {
+			return nil, nil, err
+		}
+
+		copiedIP := append(net.IP(nil), targetIP...)
+		session := newDirectDatagramSession(packetConn, &net.UDPAddr{IP: copiedIP, Port: int(targetPort)})
+		if err := session.Write(firstDatagram); err != nil {
+			lastErr = err
+			_ = session.Close()
+			continue
+		}
+		return session, copiedIP, nil
+	}
+
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no target IPs available for direct session")
+	}
+	return nil, nil, lastErr
+}
+
+func (h *Handler) openRoutedSession(
+	ctx context.Context,
+	innerSNI string,
+	targetIP net.IP,
+	targetPort uint16,
+	firstDatagram []byte,
+) (*egress.EgressNode, []net.IP, net.IP, DatagramSession, error) {
+	nodes, ips, err := h.resolveRoute(ctx, innerSNI)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+
+	directIPs := ips
+	if targetIP != nil {
+		directIPs = []net.IP{append(net.IP(nil), targetIP...)}
+	}
+
+	var lastErr error
+	for _, candidate := range nodes {
+		node := normalizeRouteNode(candidate)
+		if node == nil {
+			continue
+		}
+
+		if node.IsDirect() {
+			session, selectedIP, err := h.openDirectSession(ctx, directIPs, targetPort, firstDatagram)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			return node, ips, selectedIP, session, nil
+		}
+
+		if h.EgressClient == nil {
+			lastErr = fmt.Errorf("egress client unavailable")
+			continue
+		}
+
+		selectedIP := targetIP
+		if selectedIP == nil && len(ips) > 0 {
+			selectedIP = ips[0]
+		}
+		session, err := h.EgressClient.OpenSession(ctx, node, selectedIP, targetPort, firstDatagram)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return node, ips, selectedIP, session, nil
+	}
+
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no usable route for %q", innerSNI)
+	}
+	return nil, ips, nil, nil, lastErr
 }
 
 // handleNewSession processes the first datagram of a new UDP flow.
@@ -263,8 +557,13 @@ func (h *Handler) handleNewSession(ft FiveTuple, src, dst *net.UDPAddr, datagram
 	}
 	userID := h.Users.LookupUserID(userHash)
 
-	// Decrypt ECH to get inner SNI.
-	innerSNI, _, err := h.KeySet.Decrypt(echResult)
+	// Decrypt ECH to get inner SNI and inner ClientHello record.
+	keySet := h.currentKeySet()
+	if keySet == nil {
+		slog.Error("quic/handler: ECH keyset missing", "src", src, "outer_sni", echResult.OuterSNI)
+		return
+	}
+	innerSNI, innerCHRecord, err := keySet.DecryptWithPublicName(echResult, echResult.OuterSNI)
 	if err != nil {
 		slog.Error("quic/handler: ECH decrypt failed", "src", src, "err", err)
 		return
@@ -276,42 +575,46 @@ func (h *Handler) handleNewSession(ft FiveTuple, src, dst *net.UDPAddr, datagram
 		return
 	}
 
-	// Dial upstream target (UDP to port 443 for QUIC).
-	upstreamConn, err := net.ListenPacket("udp", ":0")
+	ctx, cancel := context.WithTimeout(context.Background(), sessionSetupTimeout)
+	defer cancel()
+
+	rewrittenInitial, err := h.prepareInitialPacket(innerCHRecord, datagram)
 	if err != nil {
-		slog.Error("quic/handler: upstream listen", "err", err)
+		slog.Error("quic/handler: initial rewrite failed", "domain", innerSNI, "err", err)
 		return
 	}
 
-	upstreamAddr := &net.UDPAddr{IP: net.ParseIP(innerSNI), Port: int(dst.Port)}
-	// If innerSNI is a hostname (not an IP), we just forward to the original destination.
-	// Real resolution would use the Resolver interface, but for QUIC transparent proxy
-	// we forward to the original destination IP that the client was connecting to.
-	upstreamAddr = &net.UDPAddr{IP: dst.IP, Port: dst.Port}
+	routeNode, ips, selectedIP, upstreamSession, err := h.openRoutedSession(ctx, innerSNI, nil, uint16(dst.Port), rewrittenInitial)
+	if err != nil {
+		slog.Error("quic/handler: resolve/route failed", "domain", innerSNI, "err", err)
+		return
+	}
+
+	if len(ips) == 0 {
+		slog.Error("quic/handler: no target IPs resolved", "domain", innerSNI)
+		_ = upstreamSession.Close()
+		return
+	}
 
 	sess := &Session{
-		Key:          ft,
-		ClientAddr:   src,
-		UpstreamConn: upstreamConn,
-		UpstreamAddr: upstreamAddr,
-		LastActive:   time.Now(),
-		InnerSNI:     innerSNI,
-		UserID:       userID,
+		Key:        ft,
+		ClientAddr: src,
+		Upstream:   upstreamSession,
+		LastActive: time.Now(),
+		InnerSNI:   innerSNI,
+		UserID:     userID,
 	}
 
 	// Store session (race: another goroutine may have beaten us).
 	if _, loaded := h.sessions.LoadOrStore(ft, sess); loaded {
 		// Another goroutine already created the session — close ours.
-		upstreamConn.Close()
+		_ = upstreamSession.Close()
 		return
 	}
 	h.sessionCount.Add(1)
 
 	slog.Info("quic/handler: new session",
-		"src", src, "domain", innerSNI, "user", userID)
-
-	// Forward the initial datagram to upstream.
-	h.forwardToUpstream(sess, datagram)
+		"src", src, "domain", innerSNI, "user", userID, "route", routeNode.Name, "target_ip", selectedIP)
 
 	// Start the reverse relay (upstream → client) in a goroutine.
 	go h.relayFromUpstream(sess)
@@ -324,38 +627,28 @@ func (h *Handler) forwardToUpstream(sess *Session, datagram []byte) {
 		sess.mu.Unlock()
 		return
 	}
-	conn := sess.UpstreamConn
-	addr := sess.UpstreamAddr
+	upstream := sess.Upstream
 	sess.mu.Unlock()
 
-	n, err := conn.WriteTo(datagram, addr)
+	err := upstream.Write(datagram)
 	if err != nil {
 		slog.Debug("quic/handler: write to upstream", "err", err)
 		return
 	}
 
 	sess.mu.Lock()
-	sess.BytesUp += int64(n)
+	sess.BytesUp += int64(len(datagram))
 	sess.mu.Unlock()
 }
 
 // relayFromUpstream reads datagrams from upstream and sends them back to the client.
 func (h *Handler) relayFromUpstream(sess *Session) {
-	defer func() {
-		sess.Close()
-		h.sessions.Delete(sess.Key)
-		h.sessionCount.Add(-1)
-		slog.Info("quic/handler: session closed",
-			"domain", sess.InnerSNI, "user", sess.UserID,
-			"bytes_up", sess.BytesUp, "bytes_down", sess.BytesDown)
-	}()
+	defer h.closeSession(sess)
 
-	buf := make([]byte, MaxDatagramSize)
 	for {
-		// Set read deadline for idle timeout.
-		sess.UpstreamConn.SetReadDeadline(time.Now().Add(IdleTimeout))
-
-		n, _, err := sess.UpstreamConn.ReadFrom(buf)
+		readCtx, cancel := context.WithTimeout(context.Background(), IdleTimeout)
+		payload, err := sess.Upstream.Read(readCtx)
+		cancel()
 		if err != nil {
 			// Check if session is closed or we're shutting down.
 			select {
@@ -363,9 +656,12 @@ func (h *Handler) relayFromUpstream(sess *Session) {
 				return
 			default:
 			}
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			if errors.Is(err, context.DeadlineExceeded) {
 				slog.Debug("quic/handler: session idle timeout",
 					"domain", sess.InnerSNI, "user", sess.UserID)
+				return
+			}
+			if errors.Is(err, io.EOF) {
 				return
 			}
 			slog.Debug("quic/handler: upstream read", "err", err)
@@ -375,14 +671,14 @@ func (h *Handler) relayFromUpstream(sess *Session) {
 		sess.Touch()
 
 		// Send back to client through the listen socket.
-		_, err = h.ListenConn.WriteTo(buf[:n], sess.ClientAddr)
+		_, err = h.ListenConn.WriteTo(payload, sess.ClientAddr)
 		if err != nil {
 			slog.Debug("quic/handler: write to client", "err", err)
 			return
 		}
 
 		sess.mu.Lock()
-		sess.BytesDown += int64(n)
+		sess.BytesDown += int64(len(payload))
 		sess.mu.Unlock()
 	}
 }
@@ -406,9 +702,7 @@ func (h *Handler) reapLoop() {
 				if idle {
 					slog.Debug("quic/handler: reaping idle session",
 						"domain", sess.InnerSNI, "user", sess.UserID)
-					sess.Close()
-					h.sessions.Delete(key)
-					h.sessionCount.Add(-1)
+					h.closeSession(sess)
 				}
 				return true
 			})

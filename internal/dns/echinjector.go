@@ -26,14 +26,15 @@ type KeySetProvider interface {
 //
 // Non-whitelisted queries are returned unchanged.
 type ECHInjector struct {
-	Whitelist  WhitelistChecker
-	ECHCache   *ECHCache
-	GatewayIP  net.IP // Gateway's IPv4 address
-	GatewayV6  net.IP // Gateway's IPv6 address (may be nil)
-	Upstream   *Upstream
-	KeySet     *ech.KeySet // for lazy ECHConfig generation
-	KeySource  KeySetProvider
-	BaseDomain string // for lazy ECHConfig generation
+	Whitelist      WhitelistChecker
+	ECHCache       *ECHCache
+	GatewayIP      net.IP // Gateway's IPv4 address
+	GatewayV6      net.IP // Gateway's IPv6 address (may be nil)
+	Upstream       *Upstream
+	KeySet         *ech.KeySet // for lazy ECHConfig generation
+	KeySource      KeySetProvider
+	BaseDomain     string // for lazy ECHConfig generation
+	AdvertiseHTTP3 bool
 }
 
 // HandleQuery implements the QueryHandler interface. It queries upstream,
@@ -45,32 +46,24 @@ func (inj *ECHInjector) HandleQuery(userHash string, msg *dns.Msg) (*dns.Msg, er
 		return resp, nil
 	}
 
-	// Query upstream first.
-	resp, err := inj.Upstream.Query(context.Background(), msg)
-	if err != nil {
-		return nil, err
-	}
-
 	qname := msg.Question[0].Name
 	domain := stripTrailingDot(qname)
-
-	if !inj.Whitelist.Contains(domain) {
-		return resp, nil
-	}
-
-	// Whitelisted domain — intercept based on query type.
 	qtype := msg.Question[0].Qtype
 
-	switch qtype {
-	case dns.TypeA:
-		return inj.injectA(msg, qname), nil
-	case dns.TypeAAAA:
-		return inj.injectAAAA(msg, qname), nil
-	case dns.TypeHTTPS:
-		return inj.injectHTTPS(msg, qname, userHash), nil
-	default:
-		return resp, nil
+	// For intercepted record types, answer locally so whitelisted traffic does
+	// not depend on upstream DoH cache warmth or resolver availability.
+	if inj.Whitelist.Contains(domain) {
+		switch qtype {
+		case dns.TypeA:
+			return inj.injectA(msg, qname), nil
+		case dns.TypeAAAA:
+			return inj.injectAAAA(msg, qname), nil
+		case dns.TypeHTTPS:
+			return inj.injectHTTPS(msg, qname, userHash), nil
+		}
 	}
+
+	return inj.passthroughQuery(msg)
 }
 
 // injectA replaces the answer with the gateway's A record.
@@ -162,7 +155,7 @@ func (inj *ECHInjector) injectHTTPS(query *dns.Msg, qname string, userHash strin
 			},
 			Priority: 1,
 			Target:   ".",
-			Value:    buildSVCBParams(echConfigList),
+			Value:    buildSVCBParams(echConfigList, inj.AdvertiseHTTP3),
 		},
 	}
 
@@ -171,9 +164,13 @@ func (inj *ECHInjector) injectHTTPS(query *dns.Msg, qname string, userHash strin
 }
 
 // buildSVCBParams constructs SVCB parameters with alpn and ech.
-func buildSVCBParams(echConfigList []byte) []dns.SVCBKeyValue {
+func buildSVCBParams(echConfigList []byte, advertiseHTTP3 bool) []dns.SVCBKeyValue {
+	alpn := []string{"h2"}
+	if advertiseHTTP3 {
+		alpn = append(alpn, "h3")
+	}
 	return []dns.SVCBKeyValue{
-		&dns.SVCBAlpn{Alpn: []string{"h2"}},
+		&dns.SVCBAlpn{Alpn: alpn},
 		&dns.SVCBECHConfig{ECH: echConfigList},
 	}
 }
@@ -196,4 +193,12 @@ func (inj *ECHInjector) currentKeySet() *ech.KeySet {
 		}
 	}
 	return inj.KeySet
+}
+
+func (inj *ECHInjector) passthroughQuery(msg *dns.Msg) (*dns.Msg, error) {
+	resp, err := inj.Upstream.Query(context.Background(), msg)
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
 }

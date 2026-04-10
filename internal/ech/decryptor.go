@@ -111,6 +111,16 @@ func (ks *KeySet) DecryptWithPublicName(result *ParseResult, publicName string) 
 		return "", nil, fmt.Errorf("ech/decrypt: expand outer_extensions: %w", err)
 	}
 
+	// --- Step 7b: Copy outer legacy_session_id into inner CH ---
+	// Per RFC 9849 §7.1, the reconstructed inner ClientHello MUST use the
+	// outer ClientHello's legacy_session_id. EncodedClientHelloInner carries
+	// an empty session_id by spec; the split-mode proxy must replace it so
+	// the upstream server echoes the session_id the client put on the wire.
+	innerCH, err = replaceSessionID(innerCH, result.RawClientHello)
+	if err != nil {
+		return "", nil, fmt.Errorf("ech/decrypt: replace session_id: %w", err)
+	}
+
 	// --- Step 8: Extract inner SNI ---
 	innerSNI, err := extractSNIFromBody(innerCH)
 	if err != nil {
@@ -272,6 +282,48 @@ func expandOuterExtensions(innerCH, outerCH []byte) ([]byte, error) {
 	// Reconstruct the inner CH body with the new extensions.
 	// Reuse the same client_version, random, session_id, cipher_suites, compression.
 	return rebuildClientHelloWithExtensions(innerCH, newExts)
+}
+
+// replaceSessionID copies the legacy_session_id from outerCH into innerCH.
+//
+// Per RFC 9849 §7.1, the reconstructed ClientHelloInner must carry the outer
+// ClientHello's legacy_session_id so the upstream server echoes the value the
+// client placed on the wire. EncodedClientHelloInner always has an empty
+// session_id; this function splices in the outer value.
+func replaceSessionID(innerCH, outerCH []byte) ([]byte, error) {
+	const prefixLen = 2 + 32 // client_version(2) + random(32)
+
+	if len(outerCH) < prefixLen+1 {
+		return nil, errors.New("replaceSessionID: outer CH too short")
+	}
+	outerSIDLen := int(outerCH[prefixLen])
+	if prefixLen+1+outerSIDLen > len(outerCH) {
+		return nil, errors.New("replaceSessionID: outer session_id overflows")
+	}
+	outerSID := outerCH[prefixLen+1 : prefixLen+1+outerSIDLen]
+
+	if len(innerCH) < prefixLen+1 {
+		return nil, errors.New("replaceSessionID: inner CH too short")
+	}
+	innerSIDLen := int(innerCH[prefixLen])
+	if prefixLen+1+innerSIDLen > len(innerCH) {
+		return nil, errors.New("replaceSessionID: inner session_id overflows")
+	}
+
+	// Fast path: session_ids are already identical.
+	if innerSIDLen == outerSIDLen {
+		copy(innerCH[prefixLen+1:], outerSID)
+		return innerCH, nil
+	}
+
+	// Rebuild: prefix + new sid_len + outer sid + rest after inner sid.
+	rest := innerCH[prefixLen+1+innerSIDLen:]
+	result := make([]byte, 0, prefixLen+1+len(outerSID)+len(rest))
+	result = append(result, innerCH[:prefixLen]...)
+	result = append(result, byte(len(outerSID)))
+	result = append(result, outerSID...)
+	result = append(result, rest...)
+	return result, nil
 }
 
 // rebuildClientHelloWithExtensions replaces the extensions in a ClientHello body

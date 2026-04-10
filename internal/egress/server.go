@@ -1,8 +1,10 @@
 package egress
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"log/slog"
@@ -11,6 +13,7 @@ import (
 	"time"
 
 	"prism/internal/relay"
+	"prism/pkg/stream"
 )
 
 const (
@@ -107,9 +110,24 @@ func (s *Server) handleConn(rawConn net.Conn) {
 
 	defer tlsConn.Close() // sends TLS close_notify before rawConn closes
 
-	// === Layer 3: Frame Protocol Validation ===
+	// === Layer 3: Frame Protocol Validation / Dispatch ===
+	reader := bufio.NewReader(tlsConn)
 	tlsConn.SetReadDeadline(time.Now().Add(frameReadTimeout))
-	frame, err := ReadFrame(tlsConn)
+	prefix, err := reader.Peek(4)
+	if err != nil {
+		slog.Debug("egress_reject_frame", "remote", remoteAddr, "err", err)
+		return
+	}
+	if binary.BigEndian.Uint32(prefix) == QUICDatagramMagic {
+		tlsConn.SetReadDeadline(time.Time{})
+		quicServer := &QUICEgressServer{DenyPrivateTargets: s.DenyPrivateTargets}
+		if err := quicServer.Serve(tlsConn, reader); err != nil {
+			slog.Debug("egress_reject_quic", "remote", remoteAddr, "err", err)
+		}
+		return
+	}
+
+	frame, err := ReadFrame(reader)
 	if err != nil {
 		slog.Debug("egress_reject_frame", "remote", remoteAddr, "err", err)
 		return
@@ -135,7 +153,7 @@ func (s *Server) handleConn(rawConn net.Conn) {
 	// Read the inner ClientHello and forward it to the target
 	tlsConn.SetReadDeadline(time.Now().Add(frameReadTimeout))
 	innerCH := make([]byte, frame.InnerCHLen)
-	if _, err := io.ReadFull(tlsConn, innerCH); err != nil {
+	if _, err := io.ReadFull(reader, innerCH); err != nil {
 		slog.Error("egress_read_inner_ch", "err", err)
 		return
 	}
@@ -143,6 +161,35 @@ func (s *Server) handleConn(rawConn net.Conn) {
 
 	if _, err := targetConn.Write(innerCH); err != nil {
 		slog.Error("egress_write_inner_ch", "target", targetAddr, "err", err)
+		return
+	}
+
+	// Wait for the first upstream TLS record before entering generic relay.
+	// If the target closes immediately after the ClientHello, return now so the
+	// gateway-side client can surface route failure and try the next rule.
+	if err := targetConn.SetReadDeadline(time.Now().Add(frameReadTimeout)); err != nil {
+		slog.Error("egress_set_target_read_deadline", "target", targetAddr, "err", err)
+		return
+	}
+	firstRecord, err := stream.NewRecordReader(targetConn).ReadRecord()
+	if err != nil {
+		slog.Error("egress_read_first_tls_record", "target", targetAddr, "err", err)
+		return
+	}
+	if err := targetConn.SetReadDeadline(time.Time{}); err != nil {
+		slog.Error("egress_clear_target_read_deadline", "target", targetAddr, "err", err)
+		return
+	}
+	if err := tlsConn.SetWriteDeadline(time.Now().Add(frameReadTimeout)); err != nil {
+		slog.Error("egress_set_gateway_write_deadline", "target", targetAddr, "err", err)
+		return
+	}
+	if _, err := tlsConn.Write(firstRecord); err != nil {
+		slog.Error("egress_write_first_tls_record", "target", targetAddr, "err", err)
+		return
+	}
+	if err := tlsConn.SetWriteDeadline(time.Time{}); err != nil {
+		slog.Error("egress_clear_gateway_write_deadline", "target", targetAddr, "err", err)
 		return
 	}
 

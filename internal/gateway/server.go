@@ -15,8 +15,10 @@ import (
 )
 
 const (
-	firstReadTimeout = 5 * time.Second
-	dialTimeout      = 5 * time.Second
+	firstReadTimeout     = 5 * time.Second
+	dialTimeout          = 5 * time.Second
+	resolveTimeout       = 8 * time.Second
+	egressForwardTimeout = dialTimeout * 2
 )
 
 // UserMatcher looks up a user by the hash extracted from the outer SNI.
@@ -68,6 +70,9 @@ type Server struct {
 
 	// Camouflage handles non-ECH TLS connections.
 	Camouflage *Camouflage
+
+	// MITM handles browser-facing intercepted whitelist traffic when enabled.
+	MITM MITMProxy
 
 	// Metrics collects per-connection metrics.
 	Metrics MetricsCollector
@@ -232,8 +237,21 @@ func (s *Server) handleECH(conn net.Conn, cr *ClassifyResult, m *ConnMetrics) {
 		return
 	}
 
+	if s.MITM != nil {
+		if err := s.MITM.Handle(context.Background(), conn, innerSNI, m); err != nil {
+			slog.Error("gateway_mitm_failed", "sni", innerSNI, "err", err)
+			m.Status = ConnStatusRelayError
+			m.ErrorType = "mitm_failed"
+			conn.Close()
+			return
+		}
+		m.Status = ConnStatusOK
+		conn.Close()
+		return
+	}
+
 	// Resolve target IPs.
-	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), resolveTimeout)
 	defer cancel()
 
 	ips, err := s.Resolver.Resolve(ctx, innerSNI)
@@ -290,24 +308,32 @@ func (s *Server) handleECH(conn net.Conn, cr *ClassifyResult, m *ConnMetrics) {
 		slog.Info("gateway_route_match", "sni", innerSNI, "egress", node.Name, "addr", node.Address)
 		m.Egress = node.Name
 
-		fwdCtx, fwdCancel := context.WithTimeout(context.Background(), dialTimeout)
-		result, err := s.EgressClient.Forward(fwdCtx, node, conn, firstIP, 443, innerCHRecord)
-		fwdCancel()
+		nodeCtx, nodeCancel := context.WithTimeout(context.Background(), egressForwardTimeout)
+		for _, targetIP := range ips {
+			if err := nodeCtx.Err(); err != nil {
+				break
+			}
 
-		if err != nil {
-			slog.Warn("gateway_egress_unavailable", "node", node.Name, "err", err, "sni", innerSNI)
-			// Continue to next rule — egress not available.
-			continue
-		}
+			result, err := s.EgressClient.Forward(nodeCtx, node, conn, targetIP, 443, innerCHRecord)
 
-		// Relay completed successfully (Forward blocks until relay ends).
-		if result != nil {
-			m.UpBytes = result.UpBytes
-			m.DownBytes = result.DownBytes
+			if err != nil {
+				slog.Warn("gateway_egress_unavailable", "node", node.Name, "target_ip", targetIP, "err", err, "sni", innerSNI)
+				continue
+			}
+
+			// Relay completed successfully (Forward blocks until relay ends).
+			if result != nil {
+				m.UpBytes = result.UpBytes
+				m.DownBytes = result.DownBytes
+			}
+			m.Status = ConnStatusOK
+			conn.Close()
+			nodeCancel()
+			return
 		}
-		m.Status = ConnStatusOK
-		conn.Close()
-		return
+		nodeCancel()
+
+		// Continue to next rule — this node could not forward any resolved IP.
 	}
 
 	// All egress nodes exhausted — report failure.

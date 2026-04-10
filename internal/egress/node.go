@@ -9,10 +9,13 @@ import (
 	"time"
 
 	"prism/internal/relay"
+	"prism/pkg/connutil"
+	"prism/pkg/stream"
 )
 
 const (
-	dialTimeout = 5 * time.Second
+	dialTimeout        = 5 * time.Second
+	firstRecordTimeout = 5 * time.Second
 )
 
 // Client represents the egress client running on the Gateway side.
@@ -51,18 +54,13 @@ func (c *Client) Forward(
 		},
 	}
 
-	deadline, ok := ctx.Deadline()
-	if !ok {
-		deadline = time.Now().Add(dialTimeout)
-	}
-
 	egressConn, err := dialer.DialContext(ctx, "tcp", node.Address)
 	if err != nil {
 		return nil, fmt.Errorf("egress: dial %s (%s): %w", node.Name, node.Address, err)
 	}
 
 	// Set a write deadline for the frame + inner CH exchange
-	if err := egressConn.SetWriteDeadline(deadline); err != nil {
+	if err := egressConn.SetWriteDeadline(stageDeadline(ctx, dialTimeout)); err != nil {
 		egressConn.Close()
 		return nil, fmt.Errorf("egress: set write deadline: %w", err)
 	}
@@ -84,8 +82,26 @@ func (c *Client) Forward(
 		return nil, fmt.Errorf("egress: write inner CH to %s: %w", node.Name, err)
 	}
 
+	if err := ctx.Err(); err != nil {
+		egressConn.Close()
+		return nil, fmt.Errorf("egress: context expired before first TLS record from %s: %w", node.Name, err)
+	}
+
+	// Wait for the first upstream TLS record before committing the route. If the
+	// remote egress node closes early (e.g. target dial failure), surface that as
+	// an error so the gateway can fall back to the next route.
+	if err := egressConn.SetReadDeadline(stageDeadline(ctx, firstRecordTimeout)); err != nil {
+		egressConn.Close()
+		return nil, fmt.Errorf("egress: set read deadline: %w", err)
+	}
+	firstRecord, err := stream.NewRecordReader(egressConn).ReadRecord()
+	if err != nil {
+		egressConn.Close()
+		return nil, fmt.Errorf("egress: read first TLS record from %s: %w", node.Name, err)
+	}
+
 	// Clear deadlines for relay phase
-	if err := egressConn.SetWriteDeadline(time.Time{}); err != nil {
+	if err := egressConn.SetDeadline(time.Time{}); err != nil {
 		egressConn.Close()
 		return nil, fmt.Errorf("egress: clear deadline: %w", err)
 	}
@@ -96,12 +112,25 @@ func (c *Client) Forward(
 		"target_port", targetPort,
 	)
 
+	relayConn := connutil.NewPrefixConn(egressConn, firstRecord)
+
 	// Relay bidirectionally
-	upWriter, downWriter := relay.NewRelayPair(clientConn, egressConn)
-	relay.RelayWithMetrics(clientConn, egressConn, upWriter, downWriter)
+	upWriter, downWriter := relay.NewRelayPair(clientConn, relayConn)
+	relay.RelayWithMetrics(clientConn, relayConn, upWriter, downWriter)
 
 	return &ForwardResult{
 		UpBytes:   upWriter.Bytes(),
 		DownBytes: downWriter.Bytes(),
 	}, nil
+}
+
+func stageDeadline(ctx context.Context, stageTimeout time.Duration) time.Time {
+	deadline := time.Now().Add(stageTimeout)
+	if ctx == nil {
+		return deadline
+	}
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		return ctxDeadline
+	}
+	return deadline
 }

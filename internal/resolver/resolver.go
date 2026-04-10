@@ -10,9 +10,15 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/miekg/dns"
+)
+
+const (
+	defaultQueryTimeout = 8 * time.Second
+	maxCacheEntries     = 10000
 )
 
 // ResolveResult holds the resolved IPs and TTL for a domain.
@@ -32,6 +38,17 @@ type Resolver struct {
 	SelfIPs []net.IP
 
 	client *http.Client
+
+	mu    sync.RWMutex
+	cache map[string]cacheEntry
+
+	nowFunc func() time.Time
+}
+
+type cacheEntry struct {
+	result    *ResolveResult
+	cachedAt  time.Time
+	expiresAt time.Time
 }
 
 // NewResolver creates a resolver with the given DoH endpoints and self IPs.
@@ -40,8 +57,10 @@ func NewResolver(endpoints []string, selfIPs []net.IP) *Resolver {
 		Endpoints: endpoints,
 		SelfIPs:   selfIPs,
 		client: &http.Client{
-			Timeout: 5 * time.Second,
+			Timeout: defaultQueryTimeout,
 		},
+		cache:   make(map[string]cacheEntry),
+		nowFunc: time.Now,
 	}
 }
 
@@ -51,7 +70,10 @@ var ErrLoopDetected = errors.New("resolver: loop detected — resolved IP matche
 // Resolve queries DNS A and AAAA records for a domain concurrently,
 // merges the results, and checks for forwarding loops.
 func (r *Resolver) Resolve(ctx context.Context, domain string) (*ResolveResult, error) {
-	fqdn := dns.Fqdn(domain)
+	fqdn := dns.CanonicalName(domain)
+	if cached := r.getCache(fqdn); cached != nil {
+		return cached, nil
+	}
 
 	type queryResult struct {
 		resp *dns.Msg
@@ -94,19 +116,17 @@ func (r *Resolver) Resolve(ctx context.Context, domain string) (*ResolveResult, 
 			continue
 		}
 		for _, rr := range qr.resp.Answer {
+			if hdr := rr.Header(); hdr != nil {
+				if first || hdr.Ttl < minTTL {
+					minTTL = hdr.Ttl
+					first = false
+				}
+			}
 			switch rec := rr.(type) {
 			case *dns.A:
 				result.IPs = append(result.IPs, rec.A)
-				if first || rec.Hdr.Ttl < minTTL {
-					minTTL = rec.Hdr.Ttl
-					first = false
-				}
 			case *dns.AAAA:
 				result.IPs = append(result.IPs, rec.AAAA)
-				if first || rec.Hdr.Ttl < minTTL {
-					minTTL = rec.Hdr.Ttl
-					first = false
-				}
 			}
 		}
 	}
@@ -126,6 +146,7 @@ func (r *Resolver) Resolve(ctx context.Context, domain string) (*ResolveResult, 
 		}
 	}
 
+	r.setCache(fqdn, result)
 	return result, nil
 }
 
@@ -178,4 +199,92 @@ func (r *Resolver) doHTTPQuery(ctx context.Context, endpoint string, query []byt
 		return nil, err
 	}
 	return &resp, nil
+}
+
+func (r *Resolver) getCache(key string) *ResolveResult {
+	r.mu.RLock()
+	entry, ok := r.cache[key]
+	r.mu.RUnlock()
+
+	if !ok || !r.now().Before(entry.expiresAt) {
+		return nil
+	}
+
+	return cloneResolveResult(entry.result, entry.expiresAt.Sub(r.now()))
+}
+
+func (r *Resolver) setCache(key string, result *ResolveResult) {
+	if result == nil || result.TTL <= 0 {
+		return
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if len(r.cache) >= maxCacheEntries*9/10 {
+		r.evictExpired()
+	}
+	if len(r.cache) >= maxCacheEntries*9/10 {
+		r.evictRandom(len(r.cache) / 10)
+	}
+
+	r.cache[key] = cacheEntry{
+		result:    cloneResolveResult(result),
+		cachedAt:  r.now(),
+		expiresAt: r.now().Add(result.TTL),
+	}
+}
+
+func (r *Resolver) evictExpired() {
+	now := r.now()
+	for key, entry := range r.cache {
+		if !now.Before(entry.expiresAt) {
+			delete(r.cache, key)
+		}
+	}
+}
+
+func (r *Resolver) evictRandom(n int) {
+	i := 0
+	for key := range r.cache {
+		if i >= n {
+			break
+		}
+		delete(r.cache, key)
+		i++
+	}
+}
+
+func (r *Resolver) now() time.Time {
+	if r.nowFunc != nil {
+		return r.nowFunc()
+	}
+	return time.Now()
+}
+
+func cloneResolveResult(result *ResolveResult, ttlOverride ...time.Duration) *ResolveResult {
+	if result == nil {
+		return nil
+	}
+
+	ips := make([]net.IP, len(result.IPs))
+	for i, ip := range result.IPs {
+		if ip == nil {
+			continue
+		}
+		ips[i] = append(net.IP(nil), ip...)
+	}
+
+	ttl := result.TTL
+	if len(ttlOverride) > 0 {
+		ttl = ttlOverride[0]
+		if ttl < 0 {
+			ttl = 0
+		}
+	}
+
+	return &ResolveResult{
+		IPs: ips,
+		TTL: ttl,
+	}
 }

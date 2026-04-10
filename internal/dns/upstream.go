@@ -24,6 +24,7 @@ const (
 // cacheEntry holds a cached DNS response with its expiry time.
 type cacheEntry struct {
 	msg       *dns.Msg
+	cachedAt  time.Time
 	expiresAt time.Time
 }
 
@@ -79,7 +80,7 @@ func (u *Upstream) Query(ctx context.Context, msg *dns.Msg) (*dns.Msg, error) {
 		return nil, err
 	}
 
-	if len(msg.Question) > 0 {
+	if len(msg.Question) > 0 && u.isCacheableResponse(resp) {
 		q := msg.Question[0]
 		key := cacheKey(q.Name, q.Qtype)
 		ttl := u.computeTTL(resp)
@@ -95,10 +96,10 @@ func (u *Upstream) getCache(key string) *dns.Msg {
 	entry, ok := u.cache[key]
 	u.mu.RUnlock()
 
-	if !ok || u.now().After(entry.expiresAt) {
+	if !ok || !u.now().Before(entry.expiresAt) {
 		return nil
 	}
-	return entry.msg
+	return u.cloneCachedResponse(entry)
 }
 
 // setCache stores a DNS response in the cache with the given TTL.
@@ -123,6 +124,7 @@ func (u *Upstream) setCache(key string, msg *dns.Msg, ttl time.Duration) {
 
 	u.cache[key] = cacheEntry{
 		msg:       msg.Copy(),
+		cachedAt:  u.now(),
 		expiresAt: u.now().Add(ttl),
 	}
 }
@@ -131,7 +133,7 @@ func (u *Upstream) setCache(key string, msg *dns.Msg, ttl time.Duration) {
 func (u *Upstream) evictExpired() {
 	now := u.now()
 	for k, v := range u.cache {
-		if now.After(v.expiresAt) {
+		if !now.Before(v.expiresAt) {
 			delete(u.cache, k)
 		}
 	}
@@ -180,6 +182,13 @@ func (u *Upstream) computeTTL(msg *dns.Msg) time.Duration {
 		minTTL = 10
 	}
 	return time.Duration(minTTL) * time.Second
+}
+
+func (u *Upstream) isCacheableResponse(msg *dns.Msg) bool {
+	if msg == nil {
+		return false
+	}
+	return msg.Rcode == dns.RcodeSuccess || msg.Rcode == dns.RcodeNameError
 }
 
 // queryUpstream performs the actual DoH request against upstream endpoints.
@@ -241,6 +250,29 @@ func (u *Upstream) now() time.Time {
 		return u.nowFunc()
 	}
 	return time.Now()
+}
+
+func (u *Upstream) cloneCachedResponse(entry cacheEntry) *dns.Msg {
+	resp := entry.msg.Copy()
+	age := u.now().Sub(entry.cachedAt)
+	if age < 0 {
+		age = 0
+	}
+	ageSeconds := uint32(age / time.Second)
+
+	for _, rr := range append(append(resp.Answer, resp.Ns...), resp.Extra...) {
+		hdr := rr.Header()
+		if hdr == nil || hdr.Rrtype == dns.TypeOPT {
+			continue
+		}
+		if hdr.Ttl <= ageSeconds {
+			hdr.Ttl = 0
+			continue
+		}
+		hdr.Ttl -= ageSeconds
+	}
+
+	return resp
 }
 
 // CacheLen returns the number of entries in the cache (for testing).

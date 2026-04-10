@@ -67,6 +67,16 @@ dns:
 
 gateway:
   listen_tcp: ":443"
+  # listen_udp: ":443"   # Enable for QUIC/HTTP3 (caution-state)
+
+# MITM: whitelist-only ECH termination with trusted Prism CA.
+# Requires a root CA certificate and key that the client browser trusts.
+# To enable: uncomment the block below and provide CA paths.
+# mitm:
+#   enable: true
+#   ca_cert: "/etc/prism/mitm/ca-cert.pem"
+#   ca_key: "/etc/prism/mitm/ca-key.pem"
+#   upstream_min_version: "1.2"   # "1.1", "1.2", or "1.3" (default: "1.2")
 
 egress:
   listen: ":9443"

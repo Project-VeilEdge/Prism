@@ -160,7 +160,7 @@ func (h *DoHHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	resp, err := h.QueryHandler.HandleQuery(userHash, &msg)
 	if err != nil {
 		slog.Error("doh_query_failed", "err", err, "user", userHash)
-		writeRefused(w, &msg)
+		writeServerFailure(w, &msg)
 		return
 	}
 
@@ -176,6 +176,16 @@ func writeRefused(w http.ResponseWriter, origMsg *dns.Msg) {
 		resp.SetRcode(origMsg, dns.RcodeRefused)
 	} else {
 		resp.Rcode = dns.RcodeRefused
+	}
+	writeDNSResponse(w, resp)
+}
+
+func writeServerFailure(w http.ResponseWriter, origMsg *dns.Msg) {
+	resp := new(dns.Msg)
+	if origMsg != nil {
+		resp.SetRcode(origMsg, dns.RcodeServerFailure)
+	} else {
+		resp.Rcode = dns.RcodeServerFailure
 	}
 	writeDNSResponse(w, resp)
 }
