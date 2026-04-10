@@ -1,5 +1,41 @@
 # Changelog
 
+## Dev.0.1.0 - 2026-04-11
+
+### Gateway architecture: MITM-only (BUG-007)
+
+- **Breaking change**: raw L4 relay path removed from TCP gateway. MITM is now the sole handler for whitelisted ECH traffic.
+- Root cause of all persistent Firefox SSL errors since Dev.0.0.1 identified as inherent fragility of raw relay path (HRR broken, DNS failures leaked as TLS alerts, relay errors swallowed).
+- Go `crypto/tls` now handles HRR, TLS version negotiation, and cipher suite selection automatically on both browser and upstream sides.
+- `handleDirect()` and `dialTarget()` functions deleted (~180 lines).
+- `handleECH()` simplified to: ECH decrypt → innerSNI → MITM.Handle().
+
+### MITM hardening
+
+- UpstreamDialer now iterates all resolved IPs instead of failing on first IP; combined errors reported via `errors.Join`.
+- MITMIssuer uses `singleflight` to deduplicate concurrent certificate generation for the same hostname.
+- DirectMITMProxy classifies errors into 8 categories (`dns_resolve`, `dial_refused`, `dial_timeout`, `upstream_tls`, `browser_tls`, `cert_issue`, `relay`, `unknown`) with structured `slog.Debug` logging.
+- ConnMetrics.ErrorType now set on all MITM error paths.
+
+### DNS resilience
+
+- Negative cache: failed resolutions cached for 30s to prevent DoH query floods.
+- Per-endpoint retry: 1 retry with 500ms delay before moving to next endpoint.
+- System DNS fallback: `net.DefaultResolver` used as last resort when all DoH endpoints fail. Controlled by `dns.system_fallback` config.
+- Prewarm API: `Prewarm(ctx, domains)` for async bulk resolution of whitelist domains at startup.
+
+### Connection handling
+
+- Semaphore-based connection concurrency limit (`gateway.max_conns`, default 10000). Excess connections receive TLS alert.
+- Relay error logging: non-expected errors (excluding EOF, closed, timeout) logged at debug level.
+- MITM enabled by default in `configs/prism.yaml` template.
+- Gateway warns at startup when MITM is not configured.
+
+### New config surface
+
+- `dns.system_fallback` (bool): enable system DNS fallback.
+- `gateway.max_conns` (int): maximum concurrent gateway connections.
+
 ## Dev.0.0.2 - 2026-04-10
 
 ### Whitelist ECH MITM gateway

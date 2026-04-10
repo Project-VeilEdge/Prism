@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"sync"
@@ -17,8 +18,11 @@ import (
 )
 
 const (
-	defaultQueryTimeout = 8 * time.Second
-	maxCacheEntries     = 10000
+	defaultQueryTimeout  = 8 * time.Second
+	maxCacheEntries      = 10000
+	negativeCacheTTL     = 30 * time.Second
+	endpointRetryDelay   = 500 * time.Millisecond
+	maxRetriesPerEndpoint = 1
 )
 
 // ResolveResult holds the resolved IPs and TTL for a domain.
@@ -37,6 +41,10 @@ type Resolver struct {
 	// of these, the query returns an error to prevent forwarding loops.
 	SelfIPs []net.IP
 
+	// SystemFallback enables falling back to the system DNS resolver
+	// when all DoH endpoints fail. Disabled by default for privacy.
+	SystemFallback bool
+
 	client *http.Client
 
 	mu    sync.RWMutex
@@ -47,6 +55,7 @@ type Resolver struct {
 
 type cacheEntry struct {
 	result    *ResolveResult
+	err       error // non-nil for negative cache entries
 	cachedAt  time.Time
 	expiresAt time.Time
 }
@@ -71,8 +80,10 @@ var ErrLoopDetected = errors.New("resolver: loop detected — resolved IP matche
 // merges the results, and checks for forwarding loops.
 func (r *Resolver) Resolve(ctx context.Context, domain string) (*ResolveResult, error) {
 	fqdn := dns.CanonicalName(domain)
-	if cached := r.getCache(fqdn); cached != nil {
-		return cached, nil
+
+	// Check cache (positive and negative).
+	if cached, cachedErr := r.getCacheOrNeg(fqdn); cached != nil || cachedErr != nil {
+		return cached, cachedErr
 	}
 
 	type queryResult struct {
@@ -101,7 +112,16 @@ func (r *Resolver) Resolve(ctx context.Context, domain string) (*ResolveResult, 
 
 	// Both failing is an error; one succeeding is fine.
 	if aResult.err != nil && aaaaResult.err != nil {
-		return nil, fmt.Errorf("resolver: query %q: A: %w; AAAA: %v", domain, aResult.err, aaaaResult.err)
+		// Try system DNS fallback if enabled.
+		if r.SystemFallback {
+			if result, err := r.systemFallback(ctx, domain); err == nil {
+				r.setCache(fqdn, result)
+				return result, nil
+			}
+		}
+		resolveErr := fmt.Errorf("resolver: query %q: A: %w; AAAA: %v", domain, aResult.err, aaaaResult.err)
+		r.setNegativeCache(fqdn, resolveErr)
+		return nil, resolveErr
 	}
 
 	result := &ResolveResult{}
@@ -132,7 +152,9 @@ func (r *Resolver) Resolve(ctx context.Context, domain string) (*ResolveResult, 
 	}
 
 	if len(result.IPs) == 0 {
-		return nil, fmt.Errorf("resolver: no A/AAAA records for %q", domain)
+		noRecErr := fmt.Errorf("resolver: no A/AAAA records for %q", domain)
+		r.setNegativeCache(fqdn, noRecErr)
+		return nil, noRecErr
 	}
 
 	result.TTL = time.Duration(minTTL) * time.Second
@@ -150,7 +172,8 @@ func (r *Resolver) Resolve(ctx context.Context, domain string) (*ResolveResult, 
 	return result, nil
 }
 
-// queryUpstream performs a DoH POST request against configured endpoints.
+// queryUpstream performs a DoH POST request against configured endpoints,
+// with per-endpoint retry.
 func (r *Resolver) queryUpstream(ctx context.Context, msg *dns.Msg) (*dns.Msg, error) {
 	packed, err := msg.Pack()
 	if err != nil {
@@ -159,12 +182,21 @@ func (r *Resolver) queryUpstream(ctx context.Context, msg *dns.Msg) (*dns.Msg, e
 
 	var lastErr error
 	for _, endpoint := range r.Endpoints {
-		resp, err := r.doHTTPQuery(ctx, endpoint, packed)
-		if err != nil {
-			lastErr = err
-			continue
+		for attempt := 0; attempt <= maxRetriesPerEndpoint; attempt++ {
+			if attempt > 0 {
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(endpointRetryDelay):
+				}
+			}
+			resp, err := r.doHTTPQuery(ctx, endpoint, packed)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			return resp, nil
 		}
-		return resp, nil
 	}
 	return nil, fmt.Errorf("all endpoints failed: %w", lastErr)
 }
@@ -201,16 +233,72 @@ func (r *Resolver) doHTTPQuery(ctx context.Context, endpoint string, query []byt
 	return &resp, nil
 }
 
-func (r *Resolver) getCache(key string) *ResolveResult {
+// getCacheOrNeg returns a cached positive result or a cached negative error.
+// Returns (nil, nil) on cache miss.
+func (r *Resolver) getCacheOrNeg(key string) (*ResolveResult, error) {
 	r.mu.RLock()
 	entry, ok := r.cache[key]
 	r.mu.RUnlock()
 
 	if !ok || !r.now().Before(entry.expiresAt) {
-		return nil
+		return nil, nil
 	}
 
-	return cloneResolveResult(entry.result, entry.expiresAt.Sub(r.now()))
+	if entry.err != nil {
+		return nil, entry.err
+	}
+
+	return cloneResolveResult(entry.result, entry.expiresAt.Sub(r.now())), nil
+}
+
+func (r *Resolver) getCache(key string) *ResolveResult {
+	result, _ := r.getCacheOrNeg(key)
+	return result
+}
+
+// setNegativeCache stores a failed resolution to prevent repeated DoH queries.
+func (r *Resolver) setNegativeCache(key string, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.cache[key] = cacheEntry{
+		err:       err,
+		cachedAt:  r.now(),
+		expiresAt: r.now().Add(negativeCacheTTL),
+	}
+}
+
+// systemFallback uses the OS resolver as a last resort.
+func (r *Resolver) systemFallback(ctx context.Context, domain string) (*ResolveResult, error) {
+	slog.Debug("resolver_system_fallback", "domain", domain)
+	addrs, err := net.DefaultResolver.LookupHost(ctx, domain)
+	if err != nil {
+		return nil, err
+	}
+	result := &ResolveResult{TTL: 30 * time.Second}
+	for _, addr := range addrs {
+		if ip := net.ParseIP(addr); ip != nil {
+			result.IPs = append(result.IPs, ip)
+		}
+	}
+	if len(result.IPs) == 0 {
+		return nil, fmt.Errorf("system resolver: no IPs for %s", domain)
+	}
+	return result, nil
+}
+
+// Prewarm asynchronously resolves all given domains to fill the cache.
+// It does not block; errors are logged at debug level.
+func (r *Resolver) Prewarm(ctx context.Context, domains []string) {
+	for _, d := range domains {
+		go func(domain string) {
+			if _, err := r.Resolve(ctx, domain); err != nil {
+				slog.Debug("resolver_prewarm_fail", "domain", domain, "err", err)
+			} else {
+				slog.Debug("resolver_prewarm_ok", "domain", domain)
+			}
+		}(d)
+	}
 }
 
 func (r *Resolver) setCache(key string, result *ResolveResult) {

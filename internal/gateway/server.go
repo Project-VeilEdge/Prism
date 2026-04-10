@@ -10,15 +10,17 @@ import (
 
 	"prism/internal/ech"
 	"prism/internal/egress"
-	"prism/internal/relay"
 	"prism/pkg/stream"
 )
 
 const (
-	firstReadTimeout     = 5 * time.Second
-	dialTimeout          = 5 * time.Second
-	resolveTimeout       = 8 * time.Second
-	egressForwardTimeout = dialTimeout * 2
+	firstReadTimeout = 5 * time.Second
+
+	// TLS alert descriptions used when the gateway cannot complete a
+	// connection. Sent as unencrypted fatal alerts before the handshake
+	// progresses past ClientHello, so the browser gets a well-formed TLS
+	// error instead of PR_END_OF_FILE_ERROR / EOF.
+	tlsAlertInternalError byte = 80 // 0x50
 )
 
 // UserMatcher looks up a user by the hash extracted from the outer SNI.
@@ -94,14 +96,27 @@ type Server struct {
 	// EgressClient forwards traffic to remote egress nodes via mTLS.
 	// Required when Router is non-nil and routes to non-direct nodes.
 	EgressClient *egress.Client
+
+	// MaxConns is the maximum number of concurrent connections.
+	// If zero, defaults to 10000.
+	MaxConns int
 }
 
 // Serve starts accepting connections. It blocks until the listener is closed
 // or ctx is canceled.
 func (s *Server) Serve(ctx context.Context) error {
+	if s.MITM == nil {
+		slog.Warn("gateway_mitm_not_configured",
+			"msg", "MITM proxy is required for ECH traffic; whitelisted connections will be rejected")
+	}
 	if s.Metrics == nil {
 		s.Metrics = NoopCollector{}
 	}
+	maxConns := s.MaxConns
+	if maxConns <= 0 {
+		maxConns = 10000
+	}
+	sem := make(chan struct{}, maxConns)
 
 	for {
 		conn, err := s.Listener.Accept()
@@ -117,7 +132,17 @@ func (s *Server) Serve(ctx context.Context) error {
 			return fmt.Errorf("gateway: accept: %w", err)
 		}
 
-		go s.handleConn(conn)
+		select {
+		case sem <- struct{}{}:
+			go func() {
+				defer func() { <-sem }()
+				s.handleConn(conn)
+			}()
+		default:
+			slog.Warn("gateway_conn_limit", "max", maxConns)
+			sendTLSAlert(conn, tlsAlertInternalError)
+			conn.Close()
+		}
 	}
 }
 
@@ -194,6 +219,7 @@ func (s *Server) handleECH(conn net.Conn, cr *ClassifyResult, m *ConnMetrics) {
 		slog.Warn("gateway_user_invalid", "outer_sni", cr.Parsed.OuterSNI, "remote", conn.RemoteAddr())
 		m.Status = ConnStatusNotWhitelisted
 		m.ErrorType = "user_invalid"
+		sendTLSAlert(conn, tlsAlertInternalError)
 		conn.Close()
 		return
 	}
@@ -208,15 +234,17 @@ func (s *Server) handleECH(conn net.Conn, cr *ClassifyResult, m *ConnMetrics) {
 		slog.Error("ech_keyset_missing", "outer_sni", cr.Parsed.OuterSNI)
 		m.Status = ConnStatusECHDecryptFail
 		m.ErrorType = "ech_keyset_missing"
+		sendTLSAlert(conn, tlsAlertInternalError)
 		conn.Close()
 		return
 	}
 
-	innerSNI, innerCHRecord, err := keySet.DecryptWithPublicName(cr.Parsed, cr.Parsed.OuterSNI)
+	innerSNI, _, err := keySet.DecryptWithPublicName(cr.Parsed, cr.Parsed.OuterSNI)
 	if err != nil {
 		slog.Error("ech_decrypt_failed", "outer_sni", cr.Parsed.OuterSNI, "err", err)
 		m.Status = ConnStatusECHDecryptFail
 		m.ErrorType = "ech_decrypt"
+		sendTLSAlert(conn, tlsAlertInternalError)
 		conn.Close()
 		return
 	}
@@ -233,150 +261,33 @@ func (s *Server) handleECH(conn net.Conn, cr *ClassifyResult, m *ConnMetrics) {
 		slog.Warn("gateway_sni_not_whitelisted", "sni", innerSNI, "user", userHash)
 		m.Status = ConnStatusNotWhitelisted
 		m.ErrorType = "not_whitelisted"
+		sendTLSAlert(conn, tlsAlertInternalError)
 		conn.Close()
 		return
 	}
 
-	if s.MITM != nil {
-		if err := s.MITM.Handle(context.Background(), conn, innerSNI, m); err != nil {
-			slog.Error("gateway_mitm_failed", "sni", innerSNI, "err", err)
-			m.Status = ConnStatusRelayError
-			m.ErrorType = "mitm_failed"
-			conn.Close()
-			return
-		}
-		m.Status = ConnStatusOK
-		conn.Close()
-		return
-	}
-
-	// Resolve target IPs.
-	ctx, cancel := context.WithTimeout(context.Background(), resolveTimeout)
-	defer cancel()
-
-	ips, err := s.Resolver.Resolve(ctx, innerSNI)
-	if err != nil {
-		slog.Error("gateway_resolve_failed", "sni", innerSNI, "err", err)
-		m.Status = ConnStatusResolveFailed
-		m.ErrorType = "resolve_failed"
-		conn.Close()
-		return
-	}
-
-	// Route: use the routing engine if configured, otherwise go direct.
-	if s.Router == nil {
-		// No router — legacy direct-connect path.
-		m.Egress = "direct"
-		s.handleDirect(conn, ips, innerCHRecord, m)
-		return
-	}
-
-	// Get the first resolved IP for CIDR/GeoIP matching.
-	var firstIP net.IP
-	if len(ips) > 0 {
-		firstIP = ips[0]
-	}
-
-	// Get all matching routes in priority order for fallback.
-	nodes := s.Router.RouteAll(innerSNI, firstIP)
-	if len(nodes) == 0 {
-		// No route matched at all — fall back to direct.
-		slog.Warn("gateway_no_route", "sni", innerSNI)
-		m.Egress = "direct"
-		s.handleDirect(conn, ips, innerCHRecord, m)
-		return
-	}
-
-	// Try each matched node in order. Skip unavailable egress nodes.
-	for _, node := range nodes {
-		if node.IsDirect() {
-			m.Egress = node.Name
-			if m.Egress == "" {
-				m.Egress = "direct"
-			}
-			slog.Info("gateway_route_match", "sni", innerSNI, "egress", m.Egress, "type", "direct")
-			s.handleDirect(conn, ips, innerCHRecord, m)
-			return
-		}
-
-		// Egress node — forward via EgressClient.
-		if s.EgressClient == nil {
-			slog.Warn("gateway_egress_no_client", "node", node.Name, "sni", innerSNI)
-			continue // skip to next rule
-		}
-
-		slog.Info("gateway_route_match", "sni", innerSNI, "egress", node.Name, "addr", node.Address)
-		m.Egress = node.Name
-
-		nodeCtx, nodeCancel := context.WithTimeout(context.Background(), egressForwardTimeout)
-		for _, targetIP := range ips {
-			if err := nodeCtx.Err(); err != nil {
-				break
-			}
-
-			result, err := s.EgressClient.Forward(nodeCtx, node, conn, targetIP, 443, innerCHRecord)
-
-			if err != nil {
-				slog.Warn("gateway_egress_unavailable", "node", node.Name, "target_ip", targetIP, "err", err, "sni", innerSNI)
-				continue
-			}
-
-			// Relay completed successfully (Forward blocks until relay ends).
-			if result != nil {
-				m.UpBytes = result.UpBytes
-				m.DownBytes = result.DownBytes
-			}
-			m.Status = ConnStatusOK
-			conn.Close()
-			nodeCancel()
-			return
-		}
-		nodeCancel()
-
-		// Continue to next rule — this node could not forward any resolved IP.
-	}
-
-	// All egress nodes exhausted — report failure.
-	slog.Error("gateway_all_egress_failed", "sni", innerSNI)
-	m.Status = ConnStatusDialFailed
-	m.ErrorType = "dial_failed"
-	conn.Close()
-}
-
-// handleDirect dials the target directly (no egress node) and relays traffic.
-func (s *Server) handleDirect(conn net.Conn, ips []net.IP, innerCHRecord []byte, m *ConnMetrics) {
-	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
-	defer cancel()
-
-	upstream, err := s.dialTarget(ctx, ips)
-	if err != nil {
-		slog.Error("gateway_dial_failed", "sni", m.InnerSNI, "err", err)
-		m.Status = ConnStatusDialFailed
-		m.ErrorType = "dial_failed"
-		conn.Close()
-		return
-	}
-
-	// Write the reconstructed inner CH record to upstream.
-	if _, err := upstream.Write(innerCHRecord); err != nil {
-		slog.Error("gateway_write_inner_ch_failed", "sni", m.InnerSNI, "err", err)
+	// MITM is the sole connection handler for whitelisted ECH traffic.
+	// It terminates TLS on both sides (browser ↔ gateway, gateway ↔ upstream),
+	// letting Go's crypto/tls handle protocol negotiation, HRR, version
+	// fallback, and cipher suite selection automatically.
+	if s.MITM == nil {
+		slog.Error("gateway_mitm_not_configured", "sni", innerSNI)
 		m.Status = ConnStatusRelayError
-		m.ErrorType = "relay_error"
-		upstream.Close()
+		m.ErrorType = "mitm_not_configured"
+		sendTLSAlert(conn, tlsAlertInternalError)
 		conn.Close()
 		return
 	}
-
-	// Start bidirectional relay.
-	upWriter, downWriter := relay.NewRelayPair(conn, upstream)
-	relay.RelayWithMetrics(conn, upstream, upWriter, downWriter)
-
-	m.UpBytes = upWriter.Bytes()
-	m.DownBytes = downWriter.Bytes()
+	if err := s.MITM.Handle(context.Background(), conn, innerSNI, m); err != nil {
+		slog.Error("gateway_mitm_failed", "sni", innerSNI, "err", err)
+		m.Status = ConnStatusRelayError
+		m.ErrorType = "mitm_failed"
+		sendTLSAlert(conn, tlsAlertInternalError)
+		conn.Close()
+		return
+	}
 	m.Status = ConnStatusOK
-
 	conn.Close()
-	upstream.Close()
 }
 
 // handleCamouflage processes a TLS connection without ECH.
@@ -406,24 +317,20 @@ func (s *Server) currentKeySet() *ech.KeySet {
 	return s.KeySet
 }
 
-// dialTarget tries to connect to one of the resolved IPs on port 443.
-func (s *Server) dialTarget(ctx context.Context, ips []net.IP) (net.Conn, error) {
-	d := s.Dialer
-	if d == nil {
-		d = &net.Dialer{Timeout: dialTimeout}
+// sendTLSAlert writes a TLS fatal alert record on the wire. Because the
+// handshake has not progressed past the browser's ClientHello, the alert is
+// sent in the clear (unencrypted). This gives the browser a well-formed TLS
+// error (e.g. SSL_ERROR_INTERNAL_ERROR_ALERT) instead of PR_END_OF_FILE_ERROR.
+func sendTLSAlert(conn net.Conn, desc byte) {
+	alert := [7]byte{
+		0x15,       // content_type = alert
+		0x03, 0x03, // version = TLS 1.2
+		0x00, 0x02, // length = 2
+		0x02, // level = fatal
+		desc, // description
 	}
-
-	var lastErr error
-	for _, ip := range ips {
-		addr := net.JoinHostPort(ip.String(), "443")
-		conn, err := d.DialContext(ctx, "tcp", addr)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		return conn, nil
-	}
-	return nil, fmt.Errorf("all %d IPs failed: %w", len(ips), lastErr)
+	conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
+	conn.Write(alert[:])
 }
 
 // extractUserHash extracts the 12-char hex hash from the outer SNI.

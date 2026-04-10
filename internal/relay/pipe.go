@@ -2,8 +2,11 @@
 package relay
 
 import (
+	"errors"
 	"io"
+	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -71,7 +74,10 @@ func RelayWithMetrics(client, upstream net.Conn, upCounter, downCounter *Countin
 		defer wg.Done()
 		buf := pool.GetRelayBuf()
 		defer pool.PutRelayBuf(buf)
-		io.CopyBuffer(upCounter, client, *buf)
+		_, err := io.CopyBuffer(upCounter, client, *buf)
+		if err != nil && !isExpectedRelayError(err) {
+			slog.Debug("relay_error", "direction", "upload", "err", err)
+		}
 		// Half-close: signal upstream that client is done sending.
 		if tc, ok := upstream.(*net.TCPConn); ok {
 			tc.CloseWrite()
@@ -83,7 +89,10 @@ func RelayWithMetrics(client, upstream net.Conn, upCounter, downCounter *Countin
 		defer wg.Done()
 		buf := pool.GetRelayBuf()
 		defer pool.PutRelayBuf(buf)
-		io.CopyBuffer(downCounter, upstream, *buf)
+		_, err := io.CopyBuffer(downCounter, upstream, *buf)
+		if err != nil && !isExpectedRelayError(err) {
+			slog.Debug("relay_error", "direction", "download", "err", err)
+		}
 		// Half-close: signal client that upstream is done sending.
 		if tc, ok := client.(*net.TCPConn); ok {
 			tc.CloseWrite()
@@ -114,6 +123,22 @@ func RelayWithMetrics(client, upstream net.Conn, upCounter, downCounter *Countin
 			}
 		}
 	}
+}
+
+// isExpectedRelayError returns true for errors that are normal during relay
+// shutdown: EOF, closed connections, and timeouts from the idle timer.
+func isExpectedRelayError(err error) bool {
+	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	if strings.Contains(err.Error(), "use of closed network connection") {
+		return true
+	}
+	return false
 }
 
 // NewRelayPair creates a matched pair of CountingWriters with a shared

@@ -52,6 +52,7 @@ dns:
   listen_doh: ":443"
   upstream_doh: "https://1.1.1.1/dns-query"
   upstream_doh_fallback: "https://8.8.8.8/dns-query"
+  system_fallback: true   # Fall back to system DNS if all DoH endpoints fail
   auth:
     enable_bearer_tokens: true
   rate_limit:
@@ -63,15 +64,19 @@ dns:
 
 gateway:
   listen_tcp: ":443"
-  # listen_udp: ":443"   # Enable for QUIC/HTTP3 (caution-state in Dev.0.0.2)
+  max_conns: 10000        # Maximum concurrent connections (default: 10000)
+  # listen_udp: ":443"   # Enable for QUIC/HTTP3 (caution-state in Dev.0.1.0)
 
 # MITM: whitelist-only ECH termination with trusted Prism CA.
+# Required for ECH traffic handling. Without MITM, whitelisted connections are rejected.
 # Requires a root CA certificate and key that the client browser trusts.
-# mitm:
-#   enable: true
-#   ca_cert: "/etc/prism/mitm/ca-cert.pem"
-#   ca_key: "/etc/prism/mitm/ca-key.pem"
-#   upstream_min_version: "1.2"   # "1.1", "1.2", or "1.3" (default: "1.2")
+# CA key must be in SEC1 PEM format (block type "EC PRIVATE KEY").
+# PKCS#8 format ("PRIVATE KEY") is not accepted. Any EC curve works (P-256, P-384, P-521).
+mitm:
+  enable: true
+  ca_cert: "/etc/prism/mitm/ca-cert.pem"
+  ca_key: "/etc/prism/mitm/ca-key.pem"
+  upstream_min_version: "1.2"   # "1.1", "1.2", or "1.3" (default: "1.2")
 
 egress:
   listen: ":9443"

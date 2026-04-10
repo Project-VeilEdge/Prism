@@ -113,6 +113,9 @@ func ParseCA(certPEM, keyPEM []byte) (*CA, error) {
 	if keyBlock == nil {
 		return nil, fmt.Errorf("mtls: no PEM block in CA key")
 	}
+	if keyBlock.Type != "EC PRIVATE KEY" {
+		return nil, fmt.Errorf("mtls: CA key must be SEC1 PEM (\"EC PRIVATE KEY\"), got %q; PKCS#8 (\"PRIVATE KEY\") is not supported", keyBlock.Type)
+	}
 	key, err := x509.ParseECPrivateKey(keyBlock.Bytes)
 	if err != nil {
 		return nil, fmt.Errorf("mtls: parse CA key: %w", err)

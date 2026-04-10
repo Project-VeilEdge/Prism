@@ -71,6 +71,8 @@ gateway:
 
 # MITM: whitelist-only ECH termination with trusted Prism CA.
 # Requires a root CA certificate and key that the client browser trusts.
+# CA key must be in SEC1 PEM format (block type "EC PRIVATE KEY").
+# PKCS#8 format ("PRIVATE KEY") is not accepted. Any EC curve works (P-256, P-384, P-521).
 # To enable: uncomment the block below and provide CA paths.
 # mitm:
 #   enable: true

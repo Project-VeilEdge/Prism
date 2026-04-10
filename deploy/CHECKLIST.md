@@ -1,6 +1,6 @@
 # Prism Deployment Checklist
 
-> Dev.0.0.2 public-dev note: this checklist matches the current public `dev` snapshot and the deploy bundle under `deploy/`.
+> Dev.0.1.0 public-dev note: this checklist matches the current public `dev` snapshot and the deploy bundle under `deploy/`.
 
 ## Pre-Deployment
 
@@ -39,7 +39,7 @@
     4. Confirm `/var/lib/prism/acme/` exists and is writable by the service runtime
   - [ ] **Option B — Manual:** Install PEM files at `/etc/prism/certs/{doh.pem,doh-key.pem,gateway.pem,gateway-key.pem}`
 - [ ] Optional: enable MITM mode for whitelist traffic:
-  - [ ] Generate or obtain a trusted CA certificate and key
+  - [ ] Generate or obtain a trusted CA certificate and EC private key in **SEC1 PEM format** (`"EC PRIVATE KEY"` block type; `openssl ecparam -genkey` produces this). PKCS#8 (`"PRIVATE KEY"`) is **not** supported.
   - [ ] Install CA files: `mkdir -p /etc/prism/mitm && cp ca-cert.pem ca-key.pem /etc/prism/mitm/`
   - [ ] Uncomment `mitm:` block in `/etc/prism/prism.yaml` and set `enable: true`
   - [ ] Import the CA certificate into client browsers as a trusted root
@@ -86,7 +86,7 @@
 - [ ] `gateway.health_listen` is not configured anywhere
 - [ ] `certs.mode=acme` is a runtime mode, not a separate post-start manual CLI step
 
-> Dev.0.0.2 runtime note: QUIC/UDP is not part of the shipped runtime surface yet. Client mode remains implementation-only for this snapshot until it has a release-credible input flow and fresh end-to-end smoke evidence. The `standalone` + `node.controller` path exists, but it is an advanced compatibility topology rather than the primary deployment story. MITM mode is available via the `mitm` config block (see `deploy/prism.yaml.template`).
+> Dev.0.1.0 runtime note: QUIC/UDP is not part of the shipped runtime surface yet. Client mode remains implementation-only for this snapshot until it has a release-credible input flow and fresh end-to-end smoke evidence. The `standalone` + `node.controller` path exists, but it is an advanced compatibility topology rather than the primary deployment story. MITM mode is the sole gateway architecture for whitelisted traffic — raw L4 relay has been removed. See `deploy/prism.yaml.template` for MITM configuration.
 
 ## Rollback
 
