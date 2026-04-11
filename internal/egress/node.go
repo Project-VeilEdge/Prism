@@ -31,6 +31,63 @@ type ForwardResult struct {
 	DownBytes int64
 }
 
+func (c *Client) dialNode(ctx context.Context, node *EgressNode) (net.Conn, error) {
+	dialer := &tls.Dialer{
+		Config: c.TLSConfig,
+		NetDialer: &net.Dialer{
+			Timeout: dialTimeout,
+		},
+	}
+	return dialer.DialContext(ctx, "tcp", node.Address)
+}
+
+func (c *Client) OpenTunnel(ctx context.Context, node *EgressNode, targetIP net.IP, targetPort uint16) (net.Conn, error) {
+	if node.IsDirect() {
+		return nil, fmt.Errorf("egress: cannot open tunnel via direct node")
+	}
+
+	egressConn, err := c.dialNode(ctx, node)
+	if err != nil {
+		return nil, fmt.Errorf("egress: dial %s (%s): %w", node.Name, node.Address, err)
+	}
+
+	if err := egressConn.SetWriteDeadline(stageDeadline(ctx, dialTimeout)); err != nil {
+		egressConn.Close()
+		return nil, fmt.Errorf("egress: set write deadline: %w", err)
+	}
+	if err := WriteFrame(egressConn, &Frame{
+		Mode:       RequestModeTCPTunnel,
+		TargetIP:   targetIP,
+		TargetPort: targetPort,
+	}); err != nil {
+		egressConn.Close()
+		return nil, fmt.Errorf("egress: write tunnel frame to %s: %w", node.Name, err)
+	}
+	if err := egressConn.SetWriteDeadline(time.Time{}); err != nil {
+		egressConn.Close()
+		return nil, fmt.Errorf("egress: clear write deadline: %w", err)
+	}
+
+	if err := egressConn.SetReadDeadline(stageDeadline(ctx, firstRecordTimeout)); err != nil {
+		egressConn.Close()
+		return nil, fmt.Errorf("egress: set read deadline: %w", err)
+	}
+	ack, err := ReadTunnelAck(egressConn)
+	if err != nil {
+		egressConn.Close()
+		return nil, fmt.Errorf("egress: read tunnel ack from %s: %w", node.Name, err)
+	}
+	if ack != TunnelAckOK {
+		egressConn.Close()
+		return nil, fmt.Errorf("egress: tunnel %s rejected: %w", node.Name, ErrTunnelRejected)
+	}
+	if err := egressConn.SetReadDeadline(time.Time{}); err != nil {
+		egressConn.Close()
+		return nil, fmt.Errorf("egress: clear read deadline: %w", err)
+	}
+	return egressConn, nil
+}
+
 // Forward connects to the given egress node, sends the frame + inner CH,
 // then relays traffic between the browser connection and the egress node.
 // innerCHRecord is the full TLS record (with 5B record header) to forward.
@@ -46,15 +103,7 @@ func (c *Client) Forward(
 		return nil, fmt.Errorf("egress: cannot forward via direct node")
 	}
 
-	// Dial the egress node with mTLS
-	dialer := &tls.Dialer{
-		Config: c.TLSConfig,
-		NetDialer: &net.Dialer{
-			Timeout: dialTimeout,
-		},
-	}
-
-	egressConn, err := dialer.DialContext(ctx, "tcp", node.Address)
+	egressConn, err := c.dialNode(ctx, node)
 	if err != nil {
 		return nil, fmt.Errorf("egress: dial %s (%s): %w", node.Name, node.Address, err)
 	}
@@ -67,6 +116,7 @@ func (c *Client) Forward(
 
 	// Write the 68-byte frame header
 	frame := &Frame{
+		Mode:       RequestModeTLSRelay,
 		InnerCHLen: uint32(len(innerCHRecord)),
 		TargetIP:   targetIP,
 		TargetPort: targetPort,

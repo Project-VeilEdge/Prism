@@ -11,6 +11,8 @@ import (
 	"prism/internal/gateway"
 )
 
+const defaultMITMLeafTTL = 24 * time.Hour
+
 type mitmRuntime struct {
 	Enabled            bool
 	Issuer             *gateway.MITMIssuer
@@ -35,7 +37,7 @@ func loadMITMRuntime(cfg *PrismConfig) (*mitmRuntime, error) {
 	}
 	rt.UpstreamMinVersion = minVersion
 
-	issuer, err := gateway.NewMITMIssuer(cfg.MITM.CACert, cfg.MITM.CAKey, 10*time.Minute)
+	issuer, err := gateway.NewMITMIssuer(cfg.MITM.CACert, cfg.MITM.CAKey, defaultMITMLeafTTL)
 	if err != nil {
 		return nil, fmt.Errorf("load mitm issuer: %w", err)
 	}

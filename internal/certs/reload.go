@@ -63,9 +63,13 @@ func (cr *CertReloader) Current() *tls.Certificate {
 }
 
 // TLSConfig returns a tls.Config that uses GetCertificate for dynamic cert loading.
+// NextProtos advertises h2 and http/1.1 so that ALPN negotiation succeeds when
+// the TLS handshake occurs before the http.Server auto-configuration (e.g.
+// standalone mode where tls.Server + Handshake precedes http.Server.Serve).
 func (cr *CertReloader) TLSConfig() *tls.Config {
 	return &tls.Config{
 		GetCertificate: cr.GetCertificate(),
+		NextProtos:     []string{"h2", "http/1.1"},
 	}
 }
 

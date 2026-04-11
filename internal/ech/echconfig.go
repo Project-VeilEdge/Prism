@@ -1,6 +1,9 @@
 package ech
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"fmt"
+)
 
 // ECH cipher suite constants (RFC 9180 / RFC 9849).
 const (
@@ -105,6 +108,25 @@ func BuildECHConfig(kp *KeyPair, publicName string) {
 	// off += 2
 
 	kp.Config = buf
+}
+
+// ConfigForPublicName returns a serialized ECHConfig for publicName using the
+// given key material without mutating the source KeyPair's Config field.
+func ConfigForPublicName(pair *KeyPair, publicName string) ([]byte, error) {
+	if pair == nil {
+		return nil, fmt.Errorf("ech: nil key pair")
+	}
+	if pair.sk == nil || pair.pk == nil {
+		return nil, fmt.Errorf("ech: incomplete key pair")
+	}
+
+	tmp := &KeyPair{
+		sk:       pair.sk,
+		pk:       pair.pk,
+		ConfigID: pair.ConfigID,
+	}
+	BuildECHConfig(tmp, publicName)
+	return append([]byte(nil), tmp.Config...), nil
 }
 
 // HPKEInfoString returns the info parameter for HPKE context:

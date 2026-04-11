@@ -1,5 +1,38 @@
 # Changelog
 
+## Dev.0.1.2 - 2026-04-11
+
+### Firefox TLS regression recovery
+
+- reverted BUG-014's explicit `CurvePreferences` pinning from both browser-facing MITM TLS configs and the upstream TLS dialer after it regressed Firefox into `SSL_ERROR_NO_CYPHER_OVERLAP` across whitelisted sites
+- kept BUG-013's browser-alert preservation, so browser-owned TLS failures are still not rewritten into a second gateway `handshake_failure`
+
+### Routed MITM upstream
+
+- added a raw TCP tunnel mode to gateway↔egress mTLS so the gateway can keep origin-side `tls.Client` termination locally while still using remote egress
+- whitelisted MITM upstream dials now honor the existing `Domain -> CIDR -> GeoIP -> Default` routing engine instead of bypassing router/egress entirely
+- routed MITM upstream now falls back across route candidates (for example remote egress to direct) while preserving the selected route in connection metrics
+
+### Public dev snapshot refresh
+
+- bumped the default CLI version to `Dev.0.1.2`
+- refreshed current-truth and public-facing docs for the routed MITM upstream design
+- regenerated the curated `../Prism-public-dev` export tree for the `Dev.0.1.2` public `dev` branch candidate
+
+## Dev.0.1.1 - 2026-04-11
+
+### Firefox TLS compatibility hardening
+
+- Browser-owned TLS failures in the native ECH MITM path are no longer masked by a second gateway-level `handshake_failure` alert.
+- Browser-facing MITM TLS configs and the upstream TLS dialer now pin classic curve preferences (`X25519`, `P-256`, `P-384`, `P-521`) instead of inheriting Go 1.26 hybrid post-quantum defaults.
+- This keeps the MITM-only / native-ECH gateway architecture unchanged while reducing browser-facing and origin-facing TLS compatibility risk for the public dev line.
+
+### Public dev snapshot refresh
+
+- bumped the default CLI version to `Dev.0.1.1`
+- refreshed the public-facing README and deploy notes for the current dev snapshot
+- regenerated the curated `../Prism-public-dev` export tree for the `Dev.0.1.1` public `dev` branch candidate
+
 ## Dev.0.1.0 - 2026-04-11
 
 ### Gateway architecture: MITM-only (BUG-007)

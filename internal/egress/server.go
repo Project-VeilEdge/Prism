@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"prism/internal/relay"
+	"prism/pkg/connutil"
 	"prism/pkg/stream"
 )
 
@@ -145,10 +146,34 @@ func (s *Server) handleConn(rawConn net.Conn) {
 
 	targetConn, err := net.DialTimeout("tcp", targetAddr, egressDialTimeout)
 	if err != nil {
+		if frame.Mode == RequestModeTCPTunnel {
+			_ = WriteTunnelAck(tlsConn, TunnelAckDialFailed)
+		}
 		slog.Error("egress_dial_target", "target", targetAddr, "err", err)
 		return
 	}
 	defer targetConn.Close()
+
+	if frame.Mode == RequestModeTCPTunnel {
+		if err := WriteTunnelAck(tlsConn, TunnelAckOK); err != nil {
+			slog.Error("egress_write_tunnel_ack", "target", targetAddr, "err", err)
+			return
+		}
+
+		var gatewayConn net.Conn = tlsConn
+		if n := reader.Buffered(); n > 0 {
+			prefix := make([]byte, n)
+			if _, err := io.ReadFull(reader, prefix); err != nil {
+				slog.Error("egress_read_tunnel_prefix", "target", targetAddr, "err", err)
+				return
+			}
+			gatewayConn = connutil.NewPrefixConn(tlsConn, prefix)
+		}
+
+		upWriter, downWriter := relay.NewRelayPair(gatewayConn, targetConn)
+		relay.RelayWithMetrics(gatewayConn, targetConn, upWriter, downWriter)
+		return
+	}
 
 	// Read the inner ClientHello and forward it to the target
 	tlsConn.SetReadDeadline(time.Now().Add(frameReadTimeout))

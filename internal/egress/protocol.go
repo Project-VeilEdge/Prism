@@ -32,10 +32,19 @@ const (
 	offTargetIP   = 10
 	offTargetPort = 26
 	offReserved   = 28
+	offMode       = offReserved
+)
+
+type RequestMode uint8
+
+const (
+	RequestModeTLSRelay RequestMode = iota
+	RequestModeTCPTunnel
 )
 
 // Frame represents the 68-byte binary header sent from Gateway to Egress.
 type Frame struct {
+	Mode       RequestMode
 	InnerCHLen uint32
 	TargetIP   net.IP // always 16-byte (IPv4-mapped-to-IPv6)
 	TargetPort uint16
@@ -44,8 +53,17 @@ type Frame struct {
 var (
 	ErrInvalidMagic   = errors.New("egress: invalid frame magic")
 	ErrInvalidVersion = errors.New("egress: unsupported frame version")
+	ErrInvalidMode    = errors.New("egress: unsupported request mode")
 	ErrShortFrame     = errors.New("egress: frame too short")
 	ErrInnerCHTooLong = errors.New("egress: InnerCHLen exceeds maximum")
+	ErrTunnelRejected = errors.New("egress: tunnel rejected")
+)
+
+type TunnelAck uint8
+
+const (
+	TunnelAckOK TunnelAck = iota
+	TunnelAckDialFailed
 )
 
 // MarshalFrame serializes a Frame into a 68-byte buffer.
@@ -62,6 +80,7 @@ func MarshalFrame(f *Frame) ([]byte, error) {
 	binary.BigEndian.PutUint32(buf[offMagic:], Magic)
 	binary.BigEndian.PutUint16(buf[offVersion:], Version)
 	binary.BigEndian.PutUint32(buf[offInnerCHLen:], f.InnerCHLen)
+	buf[offMode] = byte(f.Mode)
 
 	copy(buf[offTargetIP:offTargetIP+16], ip16)
 
@@ -87,7 +106,15 @@ func UnmarshalFrame(buf []byte) (*Frame, error) {
 		return nil, fmt.Errorf("%w: got 0x%04X", ErrInvalidVersion, version)
 	}
 
+	mode := RequestMode(buf[offMode])
+	switch mode {
+	case RequestModeTLSRelay, RequestModeTCPTunnel:
+	default:
+		return nil, fmt.Errorf("%w: got %d", ErrInvalidMode, mode)
+	}
+
 	f := &Frame{
+		Mode:       mode,
 		InnerCHLen: binary.BigEndian.Uint32(buf[offInnerCHLen:]),
 		TargetIP:   make(net.IP, 16),
 		TargetPort: binary.BigEndian.Uint16(buf[offTargetPort:]),
@@ -118,4 +145,23 @@ func WriteFrame(w io.Writer, f *Frame) error {
 	}
 	_, err = w.Write(buf)
 	return err
+}
+
+func WriteTunnelAck(w io.Writer, ack TunnelAck) error {
+	_, err := w.Write([]byte{byte(ack)})
+	return err
+}
+
+func ReadTunnelAck(r io.Reader) (TunnelAck, error) {
+	var buf [1]byte
+	if _, err := io.ReadFull(r, buf[:]); err != nil {
+		return 0, fmt.Errorf("egress: read tunnel ack: %w", err)
+	}
+	ack := TunnelAck(buf[0])
+	switch ack {
+	case TunnelAckOK, TunnelAckDialFailed:
+		return ack, nil
+	default:
+		return 0, fmt.Errorf("egress: invalid tunnel ack: %d", ack)
+	}
 }

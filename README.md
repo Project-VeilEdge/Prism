@@ -2,7 +2,7 @@
 
 Prism is a Go-based ECH/DoH gateway and distributed runtime that supports controller-managed multi-node deployment and local standalone operation.
 
-## Dev.0.1.0
+## Dev.0.1.2
 
 This repository snapshot is the public `dev` line for Prism. It is buildable and deployable, but it is not the `main` branch release surface yet.
 
@@ -11,9 +11,21 @@ This repository snapshot is the public `dev` line for Prism. It is buildable and
 - Supported: `controller`, `dns`, `gateway`, `egress`, `standalone`
 - Advanced path: `standalone` with `node.controller`
 - Gateway architecture: **MITM-only** — all whitelisted ECH traffic is terminated and re-originated via Go `crypto/tls`
-- Not part of `Dev.0.1.0`: client mode, QUIC/UDP live runtime
+- Not part of `Dev.0.1.2`: client mode, QUIC/UDP live runtime
 
-## What's new in Dev.0.1.0
+## What's new in Dev.0.1.2
+
+### Firefox / TLS regression recovery
+
+- Browser-side native-ECH TLS failures are no longer rewritten into a second gateway `handshake_failure` alert.
+- BUG-014's explicit `CurvePreferences` pinning has been removed from both browser-facing and upstream MITM TLS configs after it regressed Firefox into `SSL_ERROR_NO_CYPHER_OVERLAP` across whitelisted sites.
+- Prism now leaves curve negotiation to Go `crypto/tls` defaults on both MITM TLS edges instead of forcing a classic-only curve list.
+
+### Routed MITM upstream
+
+- Whitelisted MITM traffic no longer bypasses Prism's routing engine.
+- The gateway now supports a raw TCP tunnel mode over gateway↔egress mTLS, so routed MITM upstream dials can use remote egress and still keep origin-side `tls.Client` termination on the gateway.
+- Routed MITM upstream selection now respects the existing `Domain -> CIDR -> GeoIP -> Default` route order, with remote-egress failure falling back to later candidates such as direct.
 
 ### MITM-only gateway architecture (BUG-007)
 
@@ -65,7 +77,7 @@ make build
 Expected version output:
 
 ```text
-Dev.0.1.0
+Dev.0.1.2
 ```
 
 ## Deploy

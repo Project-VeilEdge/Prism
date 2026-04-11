@@ -10,6 +10,7 @@ import (
 
 	"prism/internal/ech"
 	"prism/internal/egress"
+	"prism/pkg/connutil"
 	"prism/pkg/stream"
 )
 
@@ -20,7 +21,8 @@ const (
 	// connection. Sent as unencrypted fatal alerts before the handshake
 	// progresses past ClientHello, so the browser gets a well-formed TLS
 	// error instead of PR_END_OF_FILE_ERROR / EOF.
-	tlsAlertInternalError byte = 80 // 0x50
+	tlsAlertHandshakeFailure byte = 40 // 0x28
+	tlsAlertInternalError    byte = 80 // 0x50
 )
 
 // UserMatcher looks up a user by the hash extracted from the outer SNI.
@@ -208,15 +210,13 @@ func (s *Server) handleConn(conn net.Conn) {
 
 // handleECH processes a connection with an ECH ClientHello.
 func (s *Server) handleECH(conn net.Conn, cr *ClassifyResult, m *ConnMetrics) {
-	// NOTE: Do NOT clear deadline here. Keep the firstReadTimeout active
-	// through the ECH decrypt phase. Clear only after decrypt succeeds.
-
 	// Extract user hash from outer SNI.
-	userHash := extractUserHash(cr.Parsed.OuterSNI, s.BaseDomain)
+	outerSNI := cr.Parsed.OuterSNI
+	userHash := extractUserHash(outerSNI, s.BaseDomain)
 	m.UserHash = userHash
 
 	if userHash == "" || !s.Users.IsValidUser(userHash) {
-		slog.Warn("gateway_user_invalid", "outer_sni", cr.Parsed.OuterSNI, "remote", conn.RemoteAddr())
+		slog.Warn("gateway_user_invalid", "outer_sni", outerSNI, "remote", conn.RemoteAddr())
 		m.Status = ConnStatusNotWhitelisted
 		m.ErrorType = "user_invalid"
 		sendTLSAlert(conn, tlsAlertInternalError)
@@ -227,67 +227,49 @@ func (s *Server) handleECH(conn net.Conn, cr *ClassifyResult, m *ConnMetrics) {
 	// Resolve user_id from hash for metrics reporting.
 	m.UserID = s.Users.LookupUserID(userHash)
 
-	// Decrypt ECH — use outer SNI as public_name since the DoH-served
-	// ECHConfig has a per-user public_name matching the outer SNI.
-	keySet := s.currentKeySet()
-	if keySet == nil {
-		slog.Error("ech_keyset_missing", "outer_sni", cr.Parsed.OuterSNI)
-		m.Status = ConnStatusECHDecryptFail
-		m.ErrorType = "ech_keyset_missing"
-		sendTLSAlert(conn, tlsAlertInternalError)
-		conn.Close()
-		return
-	}
-
-	innerSNI, _, err := keySet.DecryptWithPublicName(cr.Parsed, cr.Parsed.OuterSNI)
-	if err != nil {
-		slog.Error("ech_decrypt_failed", "outer_sni", cr.Parsed.OuterSNI, "err", err)
-		m.Status = ConnStatusECHDecryptFail
-		m.ErrorType = "ech_decrypt"
-		sendTLSAlert(conn, tlsAlertInternalError)
-		conn.Close()
-		return
-	}
-
-	// ECH decryption succeeded — clear deadline for long-lived relay.
+	// The browser-facing MITM path owns server-side ECH acceptance and inner-host
+	// selection. Once the first record has been classified, clear the deadline so
+	// the native browser-side TLS handshake can proceed normally.
 	conn.SetDeadline(time.Time{})
-
-	m.InnerSNI = innerSNI
-	m.ECHSuccess = true
-	slog.Info("ech_decrypt_ok", "user", userHash, "sni", innerSNI)
-
-	// Check whitelist.
-	if !s.Whitelist.Contains(innerSNI) {
-		slog.Warn("gateway_sni_not_whitelisted", "sni", innerSNI, "user", userHash)
-		m.Status = ConnStatusNotWhitelisted
-		m.ErrorType = "not_whitelisted"
-		sendTLSAlert(conn, tlsAlertInternalError)
-		conn.Close()
-		return
-	}
 
 	// MITM is the sole connection handler for whitelisted ECH traffic.
 	// It terminates TLS on both sides (browser ↔ gateway, gateway ↔ upstream),
-	// letting Go's crypto/tls handle protocol negotiation, HRR, version
-	// fallback, and cipher suite selection automatically.
+	// letting Go's crypto/tls handle protocol negotiation, ECH acceptance, HRR,
+	// version fallback, and cipher suite selection automatically.
 	if s.MITM == nil {
-		slog.Error("gateway_mitm_not_configured", "sni", innerSNI)
+		slog.Error("gateway_mitm_not_configured", "outer_sni", outerSNI)
 		m.Status = ConnStatusRelayError
 		m.ErrorType = "mitm_not_configured"
 		sendTLSAlert(conn, tlsAlertInternalError)
 		conn.Close()
 		return
 	}
-	if err := s.MITM.Handle(context.Background(), conn, innerSNI, m); err != nil {
-		slog.Error("gateway_mitm_failed", "sni", innerSNI, "err", err)
+	mitmConn := connutil.NewPrefixConn(conn, cr.Record)
+	if err := s.MITM.Handle(context.Background(), mitmConn, outerSNI, m); err != nil {
+		slog.Error("gateway_mitm_failed", "outer_sni", outerSNI, "err", err)
 		m.Status = ConnStatusRelayError
-		m.ErrorType = "mitm_failed"
-		sendTLSAlert(conn, tlsAlertInternalError)
+		if m.ErrorType == "" {
+			m.ErrorType = "mitm_failed"
+		}
+		if alert, ok := tlsAlertForMITMError(m.ErrorType); ok {
+			sendTLSAlert(conn, alert)
+		}
 		conn.Close()
 		return
 	}
 	m.Status = ConnStatusOK
 	conn.Close()
+}
+
+func tlsAlertForMITMError(errorType string) (byte, bool) {
+	switch errorType {
+	case "browser_tls":
+		return 0, false
+	case "dns_resolve", "dial_refused", "dial_timeout", "upstream_tls", "relay":
+		return tlsAlertHandshakeFailure, true
+	default:
+		return tlsAlertInternalError, true
+	}
 }
 
 // handleCamouflage processes a TLS connection without ECH.

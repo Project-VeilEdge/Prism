@@ -65,7 +65,7 @@ dns:
 gateway:
   listen_tcp: ":443"
   max_conns: 10000        # Maximum concurrent connections (default: 10000)
-  # listen_udp: ":443"   # Enable for QUIC/HTTP3 (caution-state in Dev.0.1.0)
+  # listen_udp: ":443"   # Enable for QUIC/HTTP3 (caution-state in Dev.0.1.2)
 
 # MITM: whitelist-only ECH termination with trusted Prism CA.
 # Required for ECH traffic handling. Without MITM, whitelisted connections are rejected.

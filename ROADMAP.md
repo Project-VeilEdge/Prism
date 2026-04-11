@@ -1,6 +1,6 @@
 # Prism Feature Roadmap
 
-> Based on the v9 blueprint (`prism-blueprint.md`) and current codebase state as of Dev.0.1.0.
+> Based on the current codebase state as of Dev.0.1.2.
 > This document tracks planned features, their dependencies, and implementation priority.
 > Last updated: 2026-04-11
 
@@ -97,7 +97,7 @@
 **Priority**: HIGH — All code changes since Dev.0.0.1 have been verified with unit/integration tests but lack live browser evidence.
 
 **Planned work**:
-- Deploy Dev.0.1.0 to test server (139.180.200.84)
+- Deploy Dev.0.1.2 to test server (139.180.200.84)
 - Firefox smoke: verify all prior SSL errors (PR_END_OF_FILE_ERROR, SSL_ERROR_INTERNAL_ERROR_ALERT, etc.) are resolved
 - Chrome smoke: verify no ERR_SSL_PROTOCOL_ERROR, ERR_QUIC_PROTOCOL_ERROR
 - Test whitelist domains: `.youtube.com`, `.ip.sb`, `.googlevideo.com`
@@ -308,5 +308,5 @@ This roadmap is derived from the v9 blueprint's Sprint 7-10 plan with the follow
 - Tests are required for all new features (TDD preferred)
 - MITM-related changes should include integration tests with real TLS handshakes
 - Config changes must be reflected in `configs/prism.yaml`, `deploy/prism.yaml.template`, and `deploy/CHECKLIST.md`
-- New runtime surfaces must be documented in `docs/STATUS.md` before release claims
+- New runtime surfaces must be documented in the active status notes before release claims
 - Public export boundary: test files and internal docs are excluded from `../Prism-public-dev`

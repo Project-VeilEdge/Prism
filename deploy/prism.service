@@ -12,7 +12,6 @@ RestartSec=5
 # --- Graceful Shutdown ---
 KillSignal=SIGTERM
 TimeoutStopSec=35
-WatchdogSec=30
 
 # --- User & Privileges ---
 DynamicUser=yes

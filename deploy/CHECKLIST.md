@@ -1,6 +1,6 @@
 # Prism Deployment Checklist
 
-> Dev.0.1.0 public-dev note: this checklist matches the current public `dev` snapshot and the deploy bundle under `deploy/`.
+> Dev.0.1.2 public-dev note: this checklist matches the current public `dev` snapshot and the deploy bundle under `deploy/`.
 
 ## Pre-Deployment
 
@@ -86,7 +86,7 @@
 - [ ] `gateway.health_listen` is not configured anywhere
 - [ ] `certs.mode=acme` is a runtime mode, not a separate post-start manual CLI step
 
-> Dev.0.1.0 runtime note: QUIC/UDP is not part of the shipped runtime surface yet. Client mode remains implementation-only for this snapshot until it has a release-credible input flow and fresh end-to-end smoke evidence. The `standalone` + `node.controller` path exists, but it is an advanced compatibility topology rather than the primary deployment story. MITM mode is the sole gateway architecture for whitelisted traffic — raw L4 relay has been removed. See `deploy/prism.yaml.template` for MITM configuration.
+> Dev.0.1.2 runtime note: QUIC/UDP is not part of the shipped runtime surface yet. Client mode remains implementation-only for this snapshot until it has a release-credible input flow and fresh end-to-end smoke evidence. The `standalone` + `node.controller` path exists, but it is an advanced compatibility topology rather than the primary deployment story. MITM mode is the sole gateway architecture for whitelisted traffic — raw L4 relay has been removed. Whitelisted MITM upstream traffic can now use the routing engine through direct or remote egress candidates. See `deploy/prism.yaml.template` for MITM configuration.
 
 ## Rollback
 

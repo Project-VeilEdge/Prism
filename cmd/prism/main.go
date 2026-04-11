@@ -25,7 +25,7 @@ import (
 // version is set at build time via:
 //
 //	go build -ldflags="-X main.version=v1.0.0" ./cmd/prism
-var version = "Dev.0.1.0"
+var version = "Dev.0.1.2"
 
 var validModes = map[string]bool{
 	"controller": true,

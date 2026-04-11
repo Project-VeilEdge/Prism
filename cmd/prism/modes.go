@@ -494,7 +494,7 @@ func startGateway(ctx context.Context, cfg *PrismConfig) (*modeResult, error) {
 		Whitelist:    validator,
 		Resolver:     &resolverAdapter{r: res},
 		Camouflage:   camo,
-		MITM:         newGatewayMITMProxy(mitmRT, &resolverAdapter{r: res}),
+		MITM:         newGatewayMITMProxy(mitmRT, hot, validator, validator, &resolverAdapter{r: res}, routingState.Router(), egressClient),
 		Metrics:      metrics,
 		BaseDomain:   cfg.BaseDomain,
 		ConnTracker:  ct,
@@ -924,7 +924,7 @@ func startStandalone(ctx context.Context, cfg *PrismConfig) (*modeResult, error)
 		Whitelist:    validator,
 		Resolver:     &resolverAdapter{r: res},
 		Camouflage:   camo,
-		MITM:         newGatewayMITMProxy(mitmRT, &resolverAdapter{r: res}),
+		MITM:         newGatewayMITMProxy(mitmRT, hot, validator, validator, &resolverAdapter{r: res}, routingState.Router(), egressClient),
 		Metrics:      metrics,
 		BaseDomain:   cfg.BaseDomain,
 		ConnTracker:  ct,
@@ -1024,16 +1024,31 @@ func buildWatchFiles(cfg *PrismConfig) []string {
 	return files
 }
 
-func newGatewayMITMProxy(rt *mitmRuntime, resolver gateway.Resolver) gateway.MITMProxy {
+func newGatewayMITMProxy(rt *mitmRuntime, keySource gateway.ECHKeySource, users gateway.UserMatcher, whitelist gateway.WhitelistChecker, resolver gateway.Resolver, router *egress.Router, egressClient *egress.Client) gateway.MITMProxy {
 	if rt == nil || !rt.Enabled || rt.Issuer == nil {
 		return nil
 	}
+
+	var upstream gateway.MITMUpstream = &gateway.UpstreamDialer{
+		Resolver:   resolver,
+		MinVersion: rt.UpstreamMinVersion,
+	}
+	if router != nil {
+		upstream = &gateway.RoutedUpstreamDialer{
+			UpstreamDialer: gateway.UpstreamDialer{
+				Resolver:   resolver,
+				MinVersion: rt.UpstreamMinVersion,
+			},
+			Router:       router,
+			TunnelOpener: egressClient,
+		}
+	}
 	return &gateway.DirectMITMProxy{
-		Issuer: rt.Issuer,
-		Upstream: &gateway.UpstreamDialer{
-			Resolver:   resolver,
-			MinVersion: rt.UpstreamMinVersion,
-		},
+		KeySource: keySource,
+		Users:     users,
+		Whitelist: whitelist,
+		Issuer:    rt.Issuer,
+		Upstream:  upstream,
 	}
 }
 
